@@ -1,3 +1,4 @@
+import numpy as np
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Union
 from PIL import Image
@@ -14,19 +15,21 @@ class SpecificDataset(VisionDataset):
     ):
         super().__init__(root, transforms, transform, target_transform)
 
-        self.trans
-        self.samples = []
-        
+        images, poses, focal = self._load_npz("data/tiny_nerf_data.npz")
+        self.images = images
+        self.poses = poses
+        self.focal = focal
+    
+    def _load_npz(self, path):
+        with np.load(path) as data:
+            images = data['images']
+            poses = data['poses']
+            focal = data['focal']
+
+        return images, poses, focal
+
     def __len__(self) -> int:
-        return len(self.samples)
+        return self.images.shape[0]
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
-        input_path, label_path = self.samples[index]
-
-        input_image = Image.open(input_path).convert("L")
-        label_mask = Image.open(label_path).convert("L")
-
-        if self.transforms is not None:
-            input_image, label_mask = self.transforms(input_image, label_mask)
-
-        return input_image, label_mask
+        return self.images[index], self.poses[index], self.focal

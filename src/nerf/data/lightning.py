@@ -7,7 +7,7 @@ from nerf.data.dataset import SpecificDataset
 class SpecificDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        root: str,
+        root: str = None,
         batch_size: int = 32,
         num_workers: int = 4,
         *args, **kwargs
@@ -65,3 +65,8 @@ class SpecificDataModule(pl.LightningDataModule):
 
 def get_datamodule(*args, **kwargs):
     return SpecificDataModule(*args, **kwargs)
+
+if __name__ == "__main__":
+    datamodule = get_datamodule()
+    datamodule.setup("fit")
+    print(next(iter(datamodule.train_dataloader())))
