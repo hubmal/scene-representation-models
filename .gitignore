@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+data/*
+logs
+0cleanup_val
+bad_labels
+logs_2
+*.png
+*.csv
+*.tex
+
+.vscode/
+*.bat
