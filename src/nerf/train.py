@@ -13,19 +13,19 @@ def trainer_args():
     return args
 
 
-def train_with_clearml(task_name, *args, tags=None, return_best_model_path=False):
-    task = Task.init(task_name=task_name, project_name="segment cardiag", tags=tags)
-    model = train(task_name, *args)
+def train_with_clearml(task_name, model, dm):
+    task = Task.init(task_name=task_name, project_name="Simple Nerf")
+    model = train(model, dm)
     return model
 
 
-def train(task_name, model, dm, args, use_early_stopping=True):
+def train(model, dm, use_early_stopping=True):
     torch.set_float32_matmul_precision('medium')
 
     trainer = Trainer(
-        max_epochs=args.max_epochs,
+        max_epochs=100,
         accelerator="cpu",
-        devices=-1,
+        # devices=[0],
         strategy="ddp_find_unused_parameters_true"
     )
         

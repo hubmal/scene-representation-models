@@ -38,44 +38,49 @@ class NerfTrainer(pl.LightningModule):
         }
     
     def _get_camera_direction_vectors(self, image, focal_length):
-        X_camera_system_coords, Y_camera_system_coords = torch.meshgrid(image.shape[0], image.shape[1])
-        X_camera_system_coords = (X_camera_system_coords.astype(float) + 0.5 - image.shape[0] // 2) / focal_length
-        Y_camera_system_coords = (Y_camera_system_coords.astype(float) + 0.5 - image.shape[1] // 2) / focal_length
-        Z = -np.ones_like(X_camera_system_coords, dtype=float)
-        return np.stack((X_camera_system_coords, Y_camera_system_coords, Z), axis=-1)
+        H, W = image.shape[:2]
+        xs = (torch.range(0, H - 1).float() + 0.5 - H // 2) / focal_length
+        ys = (torch.range(0, W - 1).float() + 0.5 - W // 2) / focal_length
+        X_camera_system_coords, Y_camera_system_coords = torch.meshgrid(xs, ys)
+        X_camera_system_coords = X_camera_system_coords.reshape(-1)
+        Y_camera_system_coords = Y_camera_system_coords.reshape(-1)
+        Z = -torch.ones_like(X_camera_system_coords, dtype=torch.float32)
+        return torch.stack((X_camera_system_coords, Y_camera_system_coords, Z), axis=-1)
 
     def any_step(self, batch, batch_idx, mode):
-        images, poses, focal_length = batch
+        images, poses, focal_lengths = batch
         image = torch.tensor(images[0, :]) # H x W x 3
         pose = torch.tensor(poses[0, :]) # 4 x 4
-        focal_length = torch.tensor(focal_length) # 1
+        focal_length = torch.tensor(focal_lengths[0]) # 1
         
         # Step 2-4: Ray casting
         camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length) # HW x 3
         camera_direction_vectors_camera_coords = torch.permute(camera_direction_vectors_camera_coords, (1, 0)) # 3 x HW
-        camera_direction_vectors_world_coords = np.matmul(pose[:3, :3], camera_direction_vectors_camera_coords).T # 3 x HW
-        camera_direction_vectors_camera_coords = torch.permute(camera_direction_vectors_world_coords, (1, 0)) # HW x 3
+        camera_direction_vectors_world_coords = torch.matmul(pose[:3, :3], camera_direction_vectors_camera_coords) # 3 x HW
+        camera_direction_vectors_world_coords = torch.permute(camera_direction_vectors_world_coords, (1, 0)) # HW x 3
         
         # Step 5: Ray Marching
         camera_center = pose[:3, 3] # (3,)
         camera_direction = pose[:3, 2] # (3,)
-        ray_points = np.linspace(self.t_n, self.t_f, self.n) #TODO: Exchange to random sampling, # (n,)
+        ray_points = torch.linspace(self.t_n, self.t_f, self.n) #TODO: Exchange to random sampling, # (n,)
 
         # Step 6: Prepare input for MLP
-        t =  np.broadcast_to(ray_points, (*camera_direction_vectors_world_coords.shape, len(ray_points))) # HW x 3 x n
-        all_points = camera_center + t * camera_direction_vectors_world_coords # HW x 3 x n
+        t =  torch.broadcast_to(ray_points, (*camera_direction_vectors_world_coords.shape, len(ray_points))) # HW x 3 x n
+        all_points = camera_center[None, :, None] + t * camera_direction_vectors_world_coords[:, :, None] # HW x 3 x n
         all_points = torch.permute(all_points, (0, 2, 1)) # HW x n x 3
         all_points = torch.reshape(all_points, (-1, 3)) # HWn x 3
         extended_camera_direction = torch.broadcast_to(camera_direction, (all_points.shape[0], 3)) #TODO: Exchange to angles, HWn x 3
-        input_tensor = torch.stack((all_points, extended_camera_direction), axis=-1) # HWn x 6
+        input_tensor = torch.concat((all_points, extended_camera_direction), axis=-1) # HWn x 6
         
         # Step 7: Pass input through a model
         output_tensor = self.model(input_tensor) # HWn x 4
 
         # Step 8: Pixel reconstruction (Classic Volume Rendering)
         output_tensor = torch.reshape(output_tensor, (image.shape[0] * image.shape[1], 4, len(ray_points))) # HW x 4 x n
-        T = torch.cumsum(output_tensor[:, 3, :], dim=-1) # HW x 1 x n
-        color_map = torch.sum(T * (1 - torch.exp(-output_tensor[:, 3, :])) * output_tensor[:, :3, :], dim=-1) # HW x 3
+        T = torch.exp(torch.cumsum(output_tensor[:, 3:4, :], dim=-1)) # HW x 1 x n
+        sigma = output_tensor[:, 3:4, :] # HW x 1 x n
+        c = output_tensor[:, :3, :] # HW x 3 x n
+        color_map = torch.sum(T * (1 - torch.exp(-sigma)) * c, dim=-1) #TODO  HW x 3
         color_map = torch.reshape(color_map, (image.shape[0], image.shape[1], 3))
 
         # Step 9-10: Loss calculation

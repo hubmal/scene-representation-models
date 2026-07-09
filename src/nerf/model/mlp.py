@@ -23,7 +23,8 @@ class MLP(nn.Module):
     def forward(self, x):
         x = self.linear1(x)
         x = self.relu1(x)
-        for hidden_layer in self.hidden_layers:
-            x = hidden_layer(x)
+        for linear_layer, relu in self.hidden_layers:
+            x = linear_layer(x)
+            x = relu(x)
         out = self.last_linear(x)
         return out
