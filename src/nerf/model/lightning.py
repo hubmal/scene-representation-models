@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -6,15 +7,19 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torchvision
 import torchvision.transforms.functional as F
 
+from nerf.model.mlp import MLP
 
-class SpecificTrainer(pl.LightningModule):
+
+class NerfTrainer(pl.LightningModule):
     def __init__(self):
-        super(SpecificTrainer, self).__init__()
+        super(NerfTrainer, self).__init__()
         
-        # self.model =
-        # self.criterion =
-        # self.lr
-        # self.f1 = F1Score(task="binary")
+        self.model = MLP()
+        self.criterion = nn.MSELoss()
+        self.lr = 1e-4
+        self.t_n = 2.0
+        self.t_f = 6.0
+        self.n = 60
 
     def forward(self, x):
         pass
@@ -31,17 +36,55 @@ class SpecificTrainer(pl.LightningModule):
             "optimizer": optimizer,
             "monitor": "val_loss"
         }
+    
+    def _get_camera_direction_vectors(self, image, focal_length):
+        X_camera_system_coords, Y_camera_system_coords = torch.meshgrid(image.shape[0], image.shape[1])
+        X_camera_system_coords = (X_camera_system_coords.astype(float) + 0.5 - image.shape[0] // 2) / focal_length
+        Y_camera_system_coords = (Y_camera_system_coords.astype(float) + 0.5 - image.shape[1] // 2) / focal_length
+        Z = -np.ones_like(X_camera_system_coords, dtype=float)
+        return np.stack((X_camera_system_coords, Y_camera_system_coords, Z), axis=-1)
 
     def any_step(self, batch, batch_idx, mode):
-        images, masks = batch
-        logits = self(images)
-        loss = self.criterion(logits, masks)
-        preds = (torch.sigmoid(logits) > 0.5).long()
+        images, poses, focal_length = batch
+        image = torch.tensor(images[0, :]) # H x W x 3
+        pose = torch.tensor(poses[0, :]) # 4 x 4
+        focal_length = torch.tensor(focal_length) # 1
+        
+        # Step 2-4: Ray casting
+        camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length) # HW x 3
+        camera_direction_vectors_camera_coords = torch.permute(camera_direction_vectors_camera_coords, (1, 0)) # 3 x HW
+        camera_direction_vectors_world_coords = np.matmul(pose[:3, :3], camera_direction_vectors_camera_coords).T # 3 x HW
+        camera_direction_vectors_camera_coords = torch.permute(camera_direction_vectors_world_coords, (1, 0)) # HW x 3
+        
+        # Step 5: Ray Marching
+        camera_center = pose[:3, 3] # (3,)
+        camera_direction = pose[:3, 2] # (3,)
+        ray_points = np.linspace(self.t_n, self.t_f, self.n) #TODO: Exchange to random sampling, # (n,)
 
-        if batch_idx == 0:
-            self.log_debug_samples(images, preds, masks, mode)
+        # Step 6: Prepare input for MLP
+        t =  np.broadcast_to(ray_points, (*camera_direction_vectors_world_coords.shape, len(ray_points))) # HW x 3 x n
+        all_points = camera_center + t * camera_direction_vectors_world_coords # HW x 3 x n
+        all_points = torch.permute(all_points, (0, 2, 1)) # HW x n x 3
+        all_points = torch.reshape(all_points, (-1, 3)) # HWn x 3
+        extended_camera_direction = torch.broadcast_to(camera_direction, (all_points.shape[0], 3)) #TODO: Exchange to angles, HWn x 3
+        input_tensor = torch.stack((all_points, extended_camera_direction), axis=-1) # HWn x 6
+        
+        # Step 7: Pass input through a model
+        output_tensor = self.model(input_tensor) # HWn x 4
 
-        return loss, logits, preds
+        # Step 8: Pixel reconstruction (Classic Volume Rendering)
+        output_tensor = torch.reshape(output_tensor, (image.shape[0] * image.shape[1], 4, len(ray_points))) # HW x 4 x n
+        T = torch.cumsum(output_tensor[:, 3, :], dim=-1) # HW x 1 x n
+        color_map = torch.sum(T * (1 - torch.exp(-output_tensor[:, 3, :])) * output_tensor[:, :3, :], dim=-1) # HW x 3
+        color_map = torch.reshape(color_map, (image.shape[0], image.shape[1], 3))
+
+        # Step 9-10: Loss calculation
+        loss = self.criterion(color_map, image)
+
+        # if batch_idx == 0:
+        #     self.log_debug_samples(images, preds, masks, mode)
+
+        return loss
 
     def training_step(self, batch, batch_idx):
         loss, _, _ = self.any_step(batch, batch_idx, "train")
