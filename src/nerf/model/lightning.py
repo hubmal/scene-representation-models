@@ -39,8 +39,8 @@ class NerfTrainer(pl.LightningModule):
     
     def _get_camera_direction_vectors(self, image, focal_length):
         H, W = image.shape[:2]
-        xs = (torch.range(0, H - 1).float() + 0.5 - H // 2) / focal_length
-        ys = (torch.range(0, W - 1).float() + 0.5 - W // 2) / focal_length
+        xs = (torch.range(0, H - 1, device=self.device).float() + 0.5 - H // 2) / focal_length
+        ys = (torch.range(0, W - 1, device=self.device).float() + 0.5 - W // 2) / focal_length
         X_camera_system_coords, Y_camera_system_coords = torch.meshgrid(xs, ys)
         X_camera_system_coords = X_camera_system_coords.reshape(-1)
         Y_camera_system_coords = Y_camera_system_coords.reshape(-1)
@@ -49,9 +49,9 @@ class NerfTrainer(pl.LightningModule):
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch
-        image = torch.tensor(images[0, :]) # H x W x 3
-        pose = torch.tensor(poses[0, :]) # 4 x 4
-        focal_length = torch.tensor(focal_lengths[0]) # 1
+        image = torch.tensor(images[0, :], device=self.device) # H x W x 3
+        pose = torch.tensor(poses[0, :], device=self.device) # 4 x 4
+        focal_length = torch.tensor(focal_lengths[0], device=self.device) # 1
         
         # Step 2-4: Ray casting
         camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length) # HW x 3
@@ -62,7 +62,7 @@ class NerfTrainer(pl.LightningModule):
         # Step 5: Ray Marching
         camera_center = pose[:3, 3] # (3,)
         camera_direction = pose[:3, 2] # (3,)
-        ray_points = torch.linspace(self.t_n, self.t_f, self.n) #TODO: Exchange to random sampling, # (n,)
+        ray_points = torch.linspace(self.t_n, self.t_f, self.n, device=self.device) #TODO: Exchange to random sampling, # (n,)
 
         # Step 6: Prepare input for MLP
         t =  torch.broadcast_to(ray_points, (*camera_direction_vectors_world_coords.shape, len(ray_points))) # HW x 3 x n
@@ -86,37 +86,19 @@ class NerfTrainer(pl.LightningModule):
         # Step 9-10: Loss calculation
         loss = self.criterion(color_map, image)
 
-        # if batch_idx == 0:
-        #     self.log_debug_samples(images, preds, masks, mode)
+        if batch_idx == 0:
+            self.log_debug_samples(color_map, image, mode)
 
         return loss
 
     def training_step(self, batch, batch_idx):
-        loss, _, _ = self.any_step(batch, batch_idx, "train")
+        loss = self.any_step(batch, batch_idx, "train")
         self.log("train_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, logits, preds = self.any_step(batch, batch_idx, "val")
-        self.log("val_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
-        images, masks = batch
-
-        if batch_idx == 0:
-            self.log_debug_samples(images, preds, masks, "val")
-        
-        device = logits.device
-        self.jaccard.to(device)
-        self.f1.to(device)
-    
-        self.jaccard.update(preds, masks.long())
-        self.f1.update(preds, masks.long())        
-        
-        self.log("val_jaccard", self.jaccard.compute(), on_epoch=True, prog_bar=True)
-        self.log("val_f1", self.f1.compute(), on_epoch=True, prog_bar=True)
-
-        self.jaccard.reset()
-        self.f1.reset()
-        
+        loss = self.any_step(batch, batch_idx, "val")
+        self.log("val_loss", loss, on_epoch=True, on_step=True, prog_bar=True)        
         return loss
     
     def test_step(self, batch, batch_idx):
@@ -139,15 +121,14 @@ class NerfTrainer(pl.LightningModule):
         
         return 0
     
-    def log_debug_samples(self, imgs, preds, labels, mode):
-        imgs = imgs.detach().cpu()
-        preds = preds.detach().cpu()
-        labels = labels.detach().cpu()
+    def log_debug_samples(self, pred, img, mode):
+        img = img.detach().cpu().permute(2, 0, 1)
+        pred = pred.detach().cpu().permute(2, 0, 1)
 
-        imgs = F.rgb_to_grayscale(torch.clamp(imgs / 2 + 0.5, 0.0, 1.0))
+        pred = torch.clamp(pred, 0.0, 1.0)
 
-        grid = torch.cat([imgs, preds, labels], dim=3)
-        grid = torchvision.utils.make_grid(grid, nrow=2)
+        # grid = torch.cat([img, pred], dim=0)
+        grid = torchvision.utils.make_grid([img, pred])
 
         if self.logger is not None and hasattr(self.logger, "experiment"):
             self.logger.experiment.add_image(f"{mode}_debug_samples", grid, self.current_epoch)

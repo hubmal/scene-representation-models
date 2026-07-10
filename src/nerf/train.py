@@ -4,6 +4,7 @@ import argparse
 from clearml import Task
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 
 
 def trainer_args():
@@ -22,11 +23,14 @@ def train_with_clearml(task_name, model, dm):
 def train(model, dm, use_early_stopping=True):
     torch.set_float32_matmul_precision('medium')
 
+    logger = TensorBoardLogger("tb_logs", name="my_model")
+
     trainer = Trainer(
         max_epochs=100,
-        accelerator="cpu",
-        # devices=[0],
-        strategy="ddp_find_unused_parameters_true"
+        accelerator="gpu",
+        devices=[0],
+        strategy="ddp_find_unused_parameters_true",
+        logger=logger
     )
         
     trainer.fit(model, dm)

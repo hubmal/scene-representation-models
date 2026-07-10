@@ -19,3 +19,5 @@ logs_2
 
 .vscode/
 *.bat
+lightning_logs/
+tb_logs/

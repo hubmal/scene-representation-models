@@ -8,7 +8,7 @@ class SpecificDataModule(pl.LightningDataModule):
     def __init__(
         self,
         root: str = None,
-        batch_size: int = 32,
+        batch_size: int = 1,
         num_workers: int = 4,
         *args, **kwargs
     ):

@@ -11,20 +11,22 @@ class MLP(nn.Module):
 
         self.linear1 = nn.Linear(in_channels, hidden_dim)
         self.relu1 = nn.ReLU()
-        self.hidden_layers = [
-            (
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU()
-            ) for _ in range(hidden_layers_num)
-        ]
-
+        self.hidden_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim), nn.ReLU()
+                )
+                for _ in range(hidden_layers_num)
+            ]
+        )
         self.last_linear = nn.Linear(hidden_dim, out_channels)
+        # self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         x = self.linear1(x)
         x = self.relu1(x)
-        for linear_layer, relu in self.hidden_layers:
-            x = linear_layer(x)
-            x = relu(x)
+        for layer in self.hidden_layers:
+            x = layer(x)
         out = self.last_linear(x)
+        # out = self.sigmoid(x)
         return out
