@@ -46,6 +46,14 @@ class NerfTrainer(pl.LightningModule):
         Y_camera_system_coords = Y_camera_system_coords.reshape(-1)
         Z = -torch.ones_like(X_camera_system_coords, dtype=torch.float32)
         return torch.stack((X_camera_system_coords, Y_camera_system_coords, Z), axis=-1)
+    
+    def _sample_ray_tracing_points(self):
+        array = np.linspace(self.t_n, self.t_f, self.n + 1)
+        assert len(array) > 1
+        low = array[:-1]
+        high = array[1:]
+        sampled = np.random.uniform(low, high)
+        return torch.tensor(sampled, device=self.device, dtype=torch.float32)
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch
@@ -62,7 +70,7 @@ class NerfTrainer(pl.LightningModule):
         # Step 5: Ray Marching
         camera_center = pose[:3, 3] # (3,)
         camera_direction = pose[:3, 2] # (3,)
-        ray_points = torch.linspace(self.t_n, self.t_f, self.n, device=self.device) #TODO: Exchange to random sampling, # (n,)
+        ray_points = self._sample_ray_tracing_points() # (n,)
 
         # Step 6: Prepare input for MLP
         t =  torch.broadcast_to(ray_points, (*camera_direction_vectors_world_coords.shape, len(ray_points))) # HW x 3 x n
@@ -79,8 +87,9 @@ class NerfTrainer(pl.LightningModule):
         output_tensor = torch.reshape(output_tensor, (image.shape[0] * image.shape[1], 4, len(ray_points))) # HW x 4 x n
         T = torch.exp(torch.cumsum(output_tensor[:, 3:4, :], dim=-1)) # HW x 1 x n
         sigma = output_tensor[:, 3:4, :] # HW x 1 x n
+        delta = (ray_points - torch.cat([torch.tensor([self.t_n], device=self.device), ray_points[:-1]]))[None, None, :] # 1 x 1 x n
         c = output_tensor[:, :3, :] # HW x 3 x n
-        color_map = torch.sum(T * (1 - torch.exp(-sigma)) * c, dim=-1) #TODO  HW x 3
+        color_map = torch.sum(T * (1 - torch.exp(-sigma * delta)) * c, dim=-1) # HW x 3
         color_map = torch.reshape(color_map, (image.shape[0], image.shape[1], 3))
 
         # Step 9-10: Loss calculation
