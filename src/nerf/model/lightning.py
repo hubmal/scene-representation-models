@@ -69,7 +69,7 @@ class NerfTrainer(pl.LightningModule):
         
         # Step 5: Ray Marching
         camera_center = pose[:3, 3] # (3,)
-        camera_direction = pose[:3, 2] # (3,)
+        camera_direction = nn.functional.normalize(pose[:3, 2], dim=0) # (3,)
         ray_points = self._sample_ray_tracing_points() # (n,)
 
         # Step 6: Prepare input for MLP
@@ -79,6 +79,12 @@ class NerfTrainer(pl.LightningModule):
         all_points = torch.reshape(all_points, (-1, 3)) # HWn x 3
         extended_camera_direction = torch.broadcast_to(camera_direction, (all_points.shape[0], 3)) #TODO: Exchange to angles, HWn x 3
         input_tensor = torch.concat((all_points, extended_camera_direction), axis=-1) # HWn x 6
+        # x_camera, y_camera, z_camera = list(camera_direction)
+        # camera_angles = torch.tensor([
+        #     torch.atan2(y_camera, x_camera), torch.atan(z_camera, torch.sqrt(x_camera ** 2, y_camera ** 2))
+        #     ], device=self.device) # (2,)
+        # extended_camera_angles = torch.broadcast_to(camera_angles, (all_points.shape[0], 3)) # HWn x 2
+        # input_tensor = torch.concat((all_points, extended_camera_angles), axis=-1) # HWn x 6
         
         # Step 7: Pass input through a model
         output_tensor = self.model(input_tensor) # HWn x 4

@@ -21,15 +21,15 @@ class SpecificDataModule(pl.LightningDataModule):
   
     def setup(self, stage):
         self.train_dataset = SpecificDataset(
-            self.root,  
+            self.root, "train",
             *self.args, **self.kwargs
         )
         self.val_dataset = SpecificDataset(
-            self.root, 
+            self.root, "val",
             *self.args, **self.kwargs
         )
         self.test_dataset = SpecificDataset(
-            self.root, 
+            self.root, "test",
             *self.args, **self.kwargs
         )
 

@@ -8,16 +8,18 @@ from torchvision.datasets import VisionDataset
 class SpecificDataset(VisionDataset):
     def __init__(
         self,
-        root: Union[str, Path],
+        root: Union[str, Path] = None,
+        _set: str = "train",
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         transforms: Optional[Callable] = None,
     ):
         super().__init__(root, transforms, transform, target_transform)
 
+        self.ratio = 0.9
         images, poses, focal = self._load_npz("data/tiny_nerf_data.npz")
-        self.images = images
-        self.poses = poses
+        self.images = images[:int(self.ratio * len(images))] if _set == "train" else images[int(self.ratio * len(images)):]
+        self.poses = poses[:int(self.ratio * len(poses))] if _set == "train" else poses[int(self.ratio * len(poses)):]
         self.focal = focal
     
     def _load_npz(self, path):
