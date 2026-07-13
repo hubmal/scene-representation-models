@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class MLP(nn.Module):
-    def __init__(self, in_location_channels=20, in_direction_channels=8, out_color_channels=3):
+    def __init__(self, in_location_channels=60, in_direction_channels=24, out_color_channels=3):
         super().__init__()
 
         self.in_location_channels = in_location_channels

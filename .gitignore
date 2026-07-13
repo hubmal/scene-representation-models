@@ -21,3 +21,4 @@ logs_2
 *.bat
 lightning_logs/
 tb_logs/
+nohup.out

@@ -57,10 +57,12 @@ class NerfTrainer(pl.LightningModule):
         return torch.tensor(sampled, device=self.device, dtype=torch.float32)
     
     def _apply_positional_encoding(self, p, L):
-        sin_basis = math.sin(pow(2, torch.arange(L, device=self.device)) * math.pi * p)
-        cos_basis = math.cos(pow(2, torch.arange(L, device=self.device)) * math.pi * p)
-        out = torch.stack((sin_basis, cos_basis), dim=1).flatten() # popraw
-        return 
+        aranged_L = torch.arange(L, device=self.device)[None, None, :]
+        x =  torch.pow(2 * torch.ones_like(aranged_L), aranged_L) * math.pi * p[:, :, None]
+        sin_basis = torch.sin(x)
+        cos_basis = torch.cos(x)
+        out = torch.stack((sin_basis, cos_basis), dim=3).flatten(start_dim=2).flatten(start_dim=1)
+        return out
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch

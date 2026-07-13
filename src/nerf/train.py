@@ -26,7 +26,7 @@ def train(model, dm, use_early_stopping=True):
     logger = TensorBoardLogger("tb_logs", name="my_model")
 
     trainer = Trainer(
-        max_epochs=100,
+        max_epochs=500,
         accelerator="gpu",
         devices=[0],
         strategy="ddp_find_unused_parameters_true",
