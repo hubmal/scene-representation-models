@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from torch import math
 import pytorch_lightning as pl
 from torchmetrics.classification import JaccardIndex, F1Score
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -54,6 +55,12 @@ class NerfTrainer(pl.LightningModule):
         high = array[1:]
         sampled = np.random.uniform(low, high)
         return torch.tensor(sampled, device=self.device, dtype=torch.float32)
+    
+    def _apply_positional_encoding(self, p, L):
+        sin_basis = math.sin(pow(2, torch.arange(L, device=self.device)) * math.pi * p)
+        cos_basis = math.cos(pow(2, torch.arange(L, device=self.device)) * math.pi * p)
+        out = torch.stack((sin_basis, cos_basis), dim=1).flatten() # popraw
+        return 
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch
@@ -78,22 +85,20 @@ class NerfTrainer(pl.LightningModule):
         all_points = torch.permute(all_points, (0, 2, 1)) # HW x n x 3
         all_points = torch.reshape(all_points, (-1, 3)) # HWn x 3
         extended_camera_direction = torch.broadcast_to(camera_direction, (all_points.shape[0], 3)) #TODO: Exchange to angles, HWn x 3
+        
+        # Positional encoding
+        all_points = self._apply_positional_encoding(all_points, L=10)
+        extended_camera_direction = self._apply_positional_encoding(extended_camera_direction, L=4)
         input_tensor = torch.concat((all_points, extended_camera_direction), axis=-1) # HWn x 6
-        # x_camera, y_camera, z_camera = list(camera_direction)
-        # camera_angles = torch.tensor([
-        #     torch.atan2(y_camera, x_camera), torch.atan(z_camera, torch.sqrt(x_camera ** 2, y_camera ** 2))
-        #     ], device=self.device) # (2,)
-        # extended_camera_angles = torch.broadcast_to(camera_angles, (all_points.shape[0], 3)) # HWn x 2
-        # input_tensor = torch.concat((all_points, extended_camera_angles), axis=-1) # HWn x 6
         
         # Step 7: Pass input through a model
         output_tensor = self.model(input_tensor) # HWn x 4
 
         # Step 8: Pixel reconstruction (Classic Volume Rendering)
         output_tensor = torch.reshape(output_tensor, (image.shape[0] * image.shape[1], 4, len(ray_points))) # HW x 4 x n
-        T = torch.exp(torch.cumsum(output_tensor[:, 3:4, :], dim=-1)) # HW x 1 x n
         sigma = output_tensor[:, 3:4, :] # HW x 1 x n
         delta = (ray_points - torch.cat([torch.tensor([self.t_n], device=self.device), ray_points[:-1]]))[None, None, :] # 1 x 1 x n
+        T = torch.exp(torch.cumsum(sigma * delta, dim=-1)) # HW x 1 x n
         c = output_tensor[:, :3, :] # HW x 3 x n
         color_map = torch.sum(T * (1 - torch.exp(-sigma * delta)) * c, dim=-1) # HW x 3
         color_map = torch.reshape(color_map, (image.shape[0], image.shape[1], 3))
