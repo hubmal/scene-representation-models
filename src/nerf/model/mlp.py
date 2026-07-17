@@ -38,7 +38,6 @@ class MLP(nn.Module):
         sigma, feature_vector = x[:, 0:1], x[:, 1:]
         x2 = self.additional_linear_layer(torch.cat([feature_vector, direction_vector], dim=1))
         x2 = self.additional_relu(x2)
-        x2 = self.output_linear_layer(x2)
-        colors = self.sigmoid(x2)
+        colors = self.output_linear_layer(x2)
         out = torch.cat([colors, sigma], dim=1)
         return out
