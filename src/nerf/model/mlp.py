@@ -12,32 +12,50 @@ class MLP(nn.Module):
 
         self.linear1 = nn.Linear(self.in_location_channels, hidden_dim)
         self.relu1 = nn.ReLU()
-        self.hidden_layers = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim), nn.ReLU()
-                )
-                for _ in range(hidden_layers_num - 2)
-            ]
-        )
-        self.last_linear = nn.Linear(hidden_dim, hidden_dim + 1)
-        self.last_relu = nn.ReLU()
-        self.additional_linear_layer = nn.Linear(hidden_dim + in_direction_channels, 128)
-        self.additional_relu = nn.ReLU()
-        self.output_linear_layer = nn.Linear(128, out_color_channels)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu2 = nn.ReLU()
+        self.linear3 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu3 = nn.ReLU()
+        self.linear4 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu4 = nn.ReLU()
+        self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu5 = nn.ReLU()
+        self.linear6 = nn.Linear(self.in_location_channels + hidden_dim, hidden_dim)
+        self.relu6 = nn.ReLU()
+        self.linear7 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu7 = nn.ReLU()
+        self.linear8 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu8 = nn.ReLU()
+        self.linear9 = nn.Linear(hidden_dim, hidden_dim + 1)
+        self.relu9 = nn.ReLU()
+        self.linear10 = nn.Linear(hidden_dim + in_direction_channels, 128)
+        self.relu10 = nn.ReLU()
+        self.linear11 = nn.Linear(128, out_color_channels)
         self.sigmoid = nn.Sigmoid()
         
     def forward(self, input):
-        x, direction_vector = input[:, :self.in_location_channels], input[:, self.in_location_channels:]
-        x = self.linear1(x)
+        point, direction_vector = input[:, :self.in_location_channels], input[:, self.in_location_channels:]
+        x = self.linear1(point)
         x = self.relu1(x)
-        for layer in self.hidden_layers:
-            x = layer(x)
-        x = self.last_linear(x)
-        x = self.last_relu(x)
-        sigma, feature_vector = x[:, 0:1], x[:, 1:]
-        x2 = self.additional_linear_layer(torch.cat([feature_vector, direction_vector], dim=1))
-        x2 = self.additional_relu(x2)
-        colors = self.output_linear_layer(x2)
+        x = self.linear2(x)
+        x = self.relu2(x)
+        x = self.linear3(x)
+        x = self.relu3(x)
+        x = self.linear4(x)
+        x = self.relu4(x)
+        x = self.linear5(x)
+        x = self.relu5(x)
+        x = self.linear6(torch.cat([point, x], dim=1))
+        x = self.relu6(x)
+        x = self.linear7(x)
+        x = self.relu7(x)
+        x = self.linear8(x)
+        x = self.relu8(x)
+        x = self.linear9(x)
+        sigma, feature_vector = self.relu9(x[:, 0:1]), x[:, 1:]
+        x2 = self.linear10(torch.cat([feature_vector, direction_vector], dim=1))
+        x2 = self.relu10(x2)
+        x2 = self.linear11(x2)
+        colors = self.sigmoid(x2)
         out = torch.cat([colors, sigma], dim=1)
         return out
