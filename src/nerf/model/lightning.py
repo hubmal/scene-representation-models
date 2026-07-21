@@ -38,13 +38,21 @@ class NerfTrainer(pl.LightningModule):
     
     def _get_camera_direction_vectors(self, image, focal_length):
         H, W = image.shape[:2]
-        xs = (torch.arange(H, device=self.device).float() + 0.5 - H // 2) / focal_length
-        ys = (torch.arange(W, device=self.device).float() + 0.5 - W // 2) / focal_length
-        X_camera_system_coords, Y_camera_system_coords = torch.meshgrid(xs, ys)
+        y, x = torch.meshgrid(
+            torch.arange(H, device=self.device).float(),
+            torch.arange(W, device=self.device).float(),
+            indexing="ij"
+        )
+        dirs_x = (x + 0.5 - W // 2) / focal_length
+        dirs_y = -(y + 0.5 - H // 2) / focal_length
+        dirs_z = -torch.ones_like(dirs_x, dtype=torch.float32)
+        ys = (torch.arange(H, device=self.device).float() + 0.5 - H // 2) / focal_length
+        xs = (torch.arange(W, device=self.device).float() + 0.5 - W // 2) / focal_length
+        X_camera_system_coords, Y_camera_system_coords = torch.meshgrid(xs, ys, indexing='ij')
         X_camera_system_coords = X_camera_system_coords.reshape(-1)
         Y_camera_system_coords = Y_camera_system_coords.reshape(-1)
         Z = -torch.ones_like(X_camera_system_coords, dtype=torch.float32)
-        return torch.stack((X_camera_system_coords, Y_camera_system_coords, Z), axis=-1)
+        return torch.stack((dirs_x, dirs_y, dirs_z), axis=-1).reshape(-1, 3)
     
     def _sample_points_for_coarse_network(self, pixels_num):
         array = torch.linspace(self.t_n, self.t_f, self.n_c + 1, device=self.device)
@@ -87,11 +95,14 @@ class NerfTrainer(pl.LightningModule):
         all_points = torch.permute(all_points, (0, 2, 1)) # batch_size x n x 3
         all_points = torch.reshape(all_points, (-1, 3)) # batch_size*n x 3
         camera_direction = torch.permute(camera_direction, (0, 2, 1)).reshape(-1, 3) # batch_size*n x 3
+        del t
         
         # Positional encoding
         all_points = self._apply_positional_encoding(all_points, L=10)
         camera_direction = self._apply_positional_encoding(camera_direction, L=4)
         input_tensor = torch.concat((all_points, camera_direction), axis=-1) # batch_size*n x 6
+        del all_points
+        del camera_direction
         
         # Step 7: Pass input through a model
         if coarse_network:
@@ -108,6 +119,9 @@ class NerfTrainer(pl.LightningModule):
         c = output_tensor[:, :3, :] # batch_size x 3 x n
         color_weights = T * (1 - torch.exp(-sigma * delta)) # batch_size x 1 x 60
         output = torch.sum(color_weights * c, dim=-1) # batch_size x 3
+        # white background
+        acc_map = torch.sum(color_weights, dim=-1) 
+        output = output + (1.0 - acc_map)
 
         if coarse_network:
             return output, color_weights.squeeze(1)
@@ -115,9 +129,13 @@ class NerfTrainer(pl.LightningModule):
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch
-        image = torch.tensor(images[0, :], device=self.device) # H x W x 3
+        image_rgba = torch.tensor(images[0, :], device=self.device) # H x W x 4
         pose = torch.tensor(poses[0, :], device=self.device) # 4 x 4
         focal_length = torch.tensor(focal_lengths[0], device=self.device) # 1
+
+        rgb = image_rgba[..., :3]
+        alpha = image_rgba[..., 3:4]
+        image = rgb * alpha + 1.0 * (1.0 - alpha)
         
         # Step 2-4: Ray casting
         camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length) # HW x 3
@@ -175,7 +193,7 @@ class NerfTrainer(pl.LightningModule):
 
         return loss
     
-    def on_val_epoch_end(self):
+    def on_validation_epoch_end(self):
         psnr_coarse_value = self.psnr_coarse.compute()
         psnr_fine_value = self.psnr_fine.compute()
 

@@ -8,7 +8,6 @@ class MLP(nn.Module):
 
         self.in_location_channels = in_location_channels
         hidden_dim  = 256
-        hidden_layers_num = 8
 
         self.linear1 = nn.Linear(self.in_location_channels, hidden_dim)
         self.relu1 = nn.ReLU()
@@ -52,7 +51,9 @@ class MLP(nn.Module):
         x = self.linear8(x)
         x = self.relu8(x)
         x = self.linear9(x)
-        sigma, feature_vector = self.relu9(x[:, 0:1]), x[:, 1:]
+        sigma, feature_vector = x[:, 0:1], x[:, 1:]
+        sigma += torch.rand_like(sigma)
+        sigma = self.relu9(sigma)
         x2 = self.linear10(torch.cat([feature_vector, direction_vector], dim=1))
         x2 = self.relu10(x2)
         x2 = self.linear11(x2)

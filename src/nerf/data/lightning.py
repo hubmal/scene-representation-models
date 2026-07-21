@@ -1,13 +1,13 @@
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
-from nerf.data.dataset import SpecificDataset
+from nerf.data.dataset import LegoDataset
 
 
-class SpecificDataModule(pl.LightningDataModule):
+class LegoDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        root: str = None,
+        root: str = "nerf_data/lego",
         batch_size: int = 1,
         num_workers: int = 4,
         *args, **kwargs
@@ -20,15 +20,15 @@ class SpecificDataModule(pl.LightningDataModule):
         self.kwargs = kwargs
   
     def setup(self, stage):
-        self.train_dataset = SpecificDataset(
+        self.train_dataset = LegoDataset(
             self.root, "train",
             *self.args, **self.kwargs
         )
-        self.val_dataset = SpecificDataset(
+        self.val_dataset = LegoDataset(
             self.root, "val",
             *self.args, **self.kwargs
         )
-        self.test_dataset = SpecificDataset(
+        self.test_dataset = LegoDataset(
             self.root, "test",
             *self.args, **self.kwargs
         )
@@ -64,7 +64,7 @@ class SpecificDataModule(pl.LightningDataModule):
         )
 
 def get_datamodule(*args, **kwargs):
-    return SpecificDataModule(*args, **kwargs)
+    return LegoDataModule(*args, **kwargs)
 
 if __name__ == "__main__":
     datamodule = get_datamodule()

@@ -22,3 +22,5 @@ logs_2
 lightning_logs/
 tb_logs/
 nohup.out
+checkpoints/
+nerf_data/
