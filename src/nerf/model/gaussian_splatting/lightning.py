@@ -156,24 +156,31 @@ class GaussianSplattingTrainer(pl.LightningModule):
         pass
 
     def _project_means(self, w, h, extrinsic_matrix, focal_length):
-        # moze byc do poprawy
-        # extrinsic_matrix, focal_length = camera_params
         intrinsic_matrix = torch.tensor([   
-            [focal_length, 0, w // 2, 0],
-            [0, focal_length, h // 2, 0],
-            [0, 0, 1, 0]
+            [focal_length, 0, w // 2],
+            [0, focal_length, h // 2]
         ], dtype=torch.float32, device=self.device)
         means_3d = torch.cat([self.positions, torch.ones((self.positions.shape[0], 1))], axis=-1).permute(1, 0)
-        W_mi = torch.matmul(extrinsic_matrix, means_3d)
+        W_mi = torch.matmul(extrinsic_matrix[:3, :], means_3d)
         means_2d = torch.matmul(intrinsic_matrix, W_mi / W_mi[2]).permute(1, 0)
-        return means_2d
+        return means_2d, W_mi
 
-    def _project_cov_matrices(self, w, h, means_2d):
-        pass
+    def _project_cov_matrices(self, means_camera, extrinsic_matrix, focal_length):
+        x_c, y_c, z_c = means_camera
+        cov_matrices_3d = self._create_covariance_matrices()
+        jacobian = torch.stack([
+            focal_length / z_c,
+            torch.zeros_like(x_c),
+            -focal_length * x_c / (z_c * z_c),
+            torch.zeros_like(x_c),
+            focal_length / z_c,
+            -focal_length * y_c / (z_c * z_c),
+        ]).reshape(-1, 2, 3) @ extrinsic_matrix[:3, :3]
+        return jacobian @ extrinsic_matrix[:3, :3] @ cov_matrices_3d @ extrinsic_matrix[:3, :3].transpose(-2, -1) @ jacobian.transpose(-2, -1)
 
     def _create_covariance_matrices(self):
-        r, i, j, k = self.quaternions
-        rotation_matrices = torch.stack([
+        r, i, j, k = self.quaternions.permute(1, 0)
+        rotation_matrices = 2 * torch.stack([
             1/2 - (j * j + k * k),
             i * j - r * k,
             i * k + r * j,
@@ -184,15 +191,14 @@ class GaussianSplattingTrainer(pl.LightningModule):
             j * k + r * i,
             1/2 - (i * i + j * j)
         ]).reshape(-1, 3, 3)
-        scaling_matrices = torch.stack(
-            torch.cat
-        )
+        scaling_matrices = torch.diag_embed(self.scaling_vectors)
+        return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
-    def _rasterize(self, w, h, camera_params):
-        means_2d = self._project_means(camera_params)
-        cov_matrices = self._project_cov_matrices(w, h, means_2d)
-        self._cull_gaussians(camera_params)
-        self._screenspace_gaussians(camera_params)
+    def _rasterize(self, w, h, extrinsic_matrix, focal_length):
+        means_2d, means_camera = self._project_means(extrinsic_matrix, focal_length)
+        cov_matrices = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
+        self._cull_gaussians(extrinsic_matrix, focal_length)
+        self._screenspace_gaussians(extrinsic_matrix, focal_length)
         tiles = self._create_tiles(w, h)
         indices, keys = self._duplicate_with_keys()
         self._sort_by_keys(keys, indices)
