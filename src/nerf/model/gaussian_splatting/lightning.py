@@ -175,7 +175,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
             torch.zeros_like(x_c),
             focal_length / z_c,
             -focal_length * y_c / (z_c * z_c),
-        ]).reshape(-1, 2, 3) @ extrinsic_matrix[:3, :3]
+        ]).reshape(-1, 2, 3)
         return jacobian @ extrinsic_matrix[:3, :3] @ cov_matrices_3d @ extrinsic_matrix[:3, :3].transpose(-2, -1) @ jacobian.transpose(-2, -1)
 
     def _create_covariance_matrices(self):
