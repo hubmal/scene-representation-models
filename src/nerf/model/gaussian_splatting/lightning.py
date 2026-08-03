@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch import math
 import pytorch_lightning as pl
+from shapely.geometry import box, Point, Polygon
 import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
 
@@ -13,11 +14,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
         super(GaussianSplattingTrainer, self).__init__()
 
         self.num_points = 5000
-        self.positions = torch.rand(self.num_points, 3) * 2 - 1
-        self.scaling_vectors = torch.rand(self.num_points, 3) * 2 - 1
-        self.quaternions = torch.rand(self.num_points, 4) * 2 - 1
-        self.colors = torch.rand(self.num_points, 3)
-        self.opacities = torch.rand(self.num_points, 1)
+        self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
+        self.scaling_vectors = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
+        self.quaternions = nn.Parameter(torch.rand(self.num_points, 4) * 2 - 1)
+        self.colors = nn.Parameter(torch.rand(self.num_points, 3))
+        self.opacities = nn.Parameter(torch.rand(self.num_points, 1))
         
         self.rays_batch_size = 4096
         self.t_n = 2.0
@@ -33,12 +34,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.psnr_fine = PSNR(data_range=1.0)
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(
-            list(self.coarse_model.parameters()) + list(self.fine_model.parameters()),
-            lr=self.lr,
-            weight_decay=self.weight_decay
-        )
-        return opt
+        # opt = torch.optim.AdamW(
+        #     list(self.coarse_model.parameters()) + list(self.fine_model.parameters()),
+        #     lr=self.lr,
+        #     weight_decay=self.weight_decay
+        # )
+        # return opt
+        return []
     
     def _get_camera_direction_vectors(self, image, focal_length):
         H, W = image.shape[:2]
@@ -137,11 +139,26 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _screenspace_gaussians(self, camera_params):
         pass
 
-    def _create_tiles(self, w, h):
-        return torch.zeros(w, h)
+    # def _create_tiles(self, w, h):
+    #     return [[] for i]
 
-    def _duplicate_with_keys(self):
-        pass
+    def _duplicate_with_keys(self, means_2d, cov_matrices, z_coords):
+        tails_num = 16
+        def in_tail(tail_idx, center, radius):
+            tile = box((tail_idx % 16) * 16, (tail_idx // 16) * 16, ((tail_idx + 1) % 16) * 16, ((tail_idx // 16) + 1) * 16)
+            gaussian = Point(center.cpu().detach().numpy()).buffer(radius.cpu().detach().numpy())
+            return (tile.intersects(gaussian))
+        eigenvalues, _ = torch.linalg.eig(cov_matrices)
+        eigenvalues = eigenvalues.real
+        max_eigenvalues, _ = eigenvalues.max(dim=1, keepdim=False)
+        radiuses = torch.ceil(3 * torch.sqrt(max_eigenvalues))
+        gaussian_lists = []
+        for tail_idx in range(tails_num):
+            gaussian_lists.append([])
+            for idx, (mean, radius) in enumerate(zip(means_2d, radiuses)):
+                if in_tail(tail_idx, mean, radius):
+                    gaussian_lists.append((idx, z_coords))
+        return gaussian_lists
 
     def _sort_by_keys(self, keys, indices):
         pass
@@ -160,7 +177,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
             [focal_length, 0, w // 2],
             [0, focal_length, h // 2]
         ], dtype=torch.float32, device=self.device)
-        means_3d = torch.cat([self.positions, torch.ones((self.positions.shape[0], 1))], axis=-1).permute(1, 0)
+        means_3d = torch.cat([self.positions, torch.ones((self.positions.shape[0], 1), device=self.device)], axis=-1).permute(1, 0)
         W_mi = torch.matmul(extrinsic_matrix[:3, :], means_3d)
         means_2d = torch.matmul(intrinsic_matrix, W_mi / W_mi[2]).permute(1, 0)
         return means_2d, W_mi
@@ -195,18 +212,16 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
     def _rasterize(self, w, h, extrinsic_matrix, focal_length):
-        means_2d, means_camera = self._project_means(extrinsic_matrix, focal_length)
+        # self._cull_gaussians(extrinsic_matrix, focal_length)
+        means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
         cov_matrices = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
-        self._cull_gaussians(extrinsic_matrix, focal_length)
-        self._screenspace_gaussians(extrinsic_matrix, focal_length)
-        tiles = self._create_tiles(w, h)
-        indices, keys = self._duplicate_with_keys()
-        self._sort_by_keys(keys, indices)
-        ranges = self._identify_tile_ranges(tiles, keys)
-        for tile in tiles:
-            for pixel in tiles:
-                range = self._get_tile_range(ranges, tile)
-                self._blend_in_order(pixel, indices, range, keys)
+        # tiles = self._create_tiles(w // 16, h // 16)
+        tiles = []
+        gaussian_lists = self._duplicate_with_keys(means_2d, cov_matrices, means_camera[2, :])
+        self._sort_by_keys(gaussian_lists)
+        # for tile in tiles:
+            # for pixel in tiles:
+                # self._blend_in_order(pixel, indices, range, keys)
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch
@@ -218,7 +233,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         alpha = image_rgba[..., 3:4]
         image = rgb * alpha + 1.0 * (1.0 - alpha)
 
-        output = self._rasterize(image.shape[0], image.shape[1], (pose, focal_length))
+        output = self._rasterize(image.shape[0], image.shape[1], pose, focal_length)
         
         # Step 2-4: Ray casting
         camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length) # HW x 3
