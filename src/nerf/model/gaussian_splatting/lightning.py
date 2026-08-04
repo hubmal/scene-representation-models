@@ -136,12 +136,6 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _cull_gaussians(self, camera_params):
         pass
 
-    def _screenspace_gaussians(self, camera_params):
-        pass
-
-    # def _create_tiles(self, w, h):
-    #     return [[] for i]
-
     def _duplicate_with_keys(self, means_2d, cov_matrices, z_coords):
         tails_num = 16
         def in_tail(tail_idx, center, radius):
@@ -160,8 +154,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
                     gaussian_lists.append((idx, z_coords))
         return gaussian_lists
 
-    def _sort_by_keys(self, keys, indices):
-        pass
+    def _sort_by_keys(self, gaussian_lists):
+        new_gaussian_lists = []
+        for gaussian_list in gaussian_lists:
+            new_gaussian_lists.append(sorted(gaussian_list, key=lambda elem : elem[1]))
+        return new_gaussian_lists
 
     def _identify_tile_ranges(tiles, keys):
         pass
@@ -218,10 +215,9 @@ class GaussianSplattingTrainer(pl.LightningModule):
         # tiles = self._create_tiles(w // 16, h // 16)
         tiles = []
         gaussian_lists = self._duplicate_with_keys(means_2d, cov_matrices, means_camera[2, :])
-        self._sort_by_keys(gaussian_lists)
-        # for tile in tiles:
-            # for pixel in tiles:
-                # self._blend_in_order(pixel, indices, range, keys)
+        sorted_gaussians = self._sort_by_keys(gaussian_lists)
+        # for pixel in tiles:
+        #     self._blend_in_order(pixel, indices, range, keys)
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch
