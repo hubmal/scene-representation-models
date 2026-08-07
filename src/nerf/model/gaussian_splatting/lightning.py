@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 from shapely.geometry import box, Point, Polygon
 import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
+from piqa.ssim import SSIM
 
 from nerf.model.gaussian_splatting.pcd import PCD
 
@@ -19,6 +20,9 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.quaternions = nn.Parameter(torch.rand(self.num_points, 4) * 2 - 1)
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
         self.opacities = nn.Parameter(torch.rand(self.num_points, 1))
+        self.tiles_size = 50
+        self.tiles_num_h = 4
+        self.tiles_num_w = 4
         
         self.rays_batch_size = 4096
         self.t_n = 2.0
@@ -26,12 +30,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.n_c = 64
         self.n_f = 124
         
-        self.criterion = nn.MSELoss()
+        self.l1_loss = nn.L1Loss()
+        self.ssim = SSIM()
+        self._lambda = 0.2
         self.lr = 5e-4
         self.weight_decay = 5e-5
 
-        self.psnr_coarse = PSNR(data_range=1.0)
-        self.psnr_fine = PSNR(data_range=1.0)
+        self.psnr = PSNR(data_range=1.0)
 
     def configure_optimizers(self):
         # opt = torch.optim.AdamW(
@@ -41,133 +46,56 @@ class GaussianSplattingTrainer(pl.LightningModule):
         # )
         # return opt
         return []
-    
-    def _get_camera_direction_vectors(self, image, focal_length):
-        H, W = image.shape[:2]
-        y, x = torch.meshgrid(
-            torch.arange(H, device=self.device).float(),
-            torch.arange(W, device=self.device).float(),
-            indexing="ij"
-        )
-        dirs_x = (x + 0.5 - W // 2) / focal_length
-        dirs_y = -(y + 0.5 - H // 2) / focal_length
-        dirs_z = -torch.ones_like(dirs_x, dtype=torch.float32)
-        ys = (torch.arange(H, device=self.device).float() + 0.5 - H // 2) / focal_length
-        xs = (torch.arange(W, device=self.device).float() + 0.5 - W // 2) / focal_length
-        X_camera_system_coords, Y_camera_system_coords = torch.meshgrid(xs, ys, indexing='ij')
-        X_camera_system_coords = X_camera_system_coords.reshape(-1)
-        Y_camera_system_coords = Y_camera_system_coords.reshape(-1)
-        Z = -torch.ones_like(X_camera_system_coords, dtype=torch.float32)
-        return torch.stack((dirs_x, dirs_y, dirs_z), axis=-1).reshape(-1, 3)
-    
-    def _sample_points_for_coarse_network(self, pixels_num):
-        array = torch.linspace(self.t_n, self.t_f, self.n_c + 1, device=self.device)
-        array = torch.broadcast_to(array, (pixels_num, self.n_c + 1))
-        low = array[:, :-1]
-        high = array[:, 1:]
-        u = torch.rand_like(low)
-        sampled = low + (high - low) * u
-        return sampled
-    
-    @torch.no_grad
-    def _sample_points_for_fine_network(self, probs):
-        eps = 1e-5
-        probs = torch.clamp(probs, min=eps)
-        array = torch.linspace(self.t_n, self.t_f, self.n_c + 1, device=self.device)
-        assert len(array) > 1
-        low_bounds = array[:-1]
-        high_bounds = array[1:]
-        distribution = torch.distributions.Categorical(probs=probs)
-        sampled_bins_indices = distribution.sample((self.n_f,)).T.to(self.device)
-        low = low_bounds[sampled_bins_indices]
-        high = high_bounds[sampled_bins_indices]
-        u = torch.rand_like(low)
-        sampled = low + (high - low) * u
-        return sampled
-    
-    def _apply_positional_encoding(self, p, L):
-        aranged_L = torch.arange(L, device=self.device)[None, None, :]
-        x =  torch.pow(2 * torch.ones_like(aranged_L), aranged_L) * math.pi * p[:, :, None]
-        sin_basis = torch.sin(x)
-        cos_basis = torch.cos(x)
-        out = torch.stack((sin_basis, cos_basis), dim=3).flatten(start_dim=2).flatten(start_dim=1)
-        return out
-    
-    def _render_volume(self, ray_points, camera_center, camera_direction, ray_points_num, coarse_network=True):
-        # Step 6: Prepare input for MLP
-        t =  torch.broadcast_to(ray_points[:, None, :], (*camera_direction.shape, ray_points.shape[-1])) # batch_size x 3 x n
-        camera_direction = torch.broadcast_to(camera_direction[:, :, None], (*camera_direction.shape, ray_points.shape[-1])) # batch_size x 3 x n
-        all_points = camera_center[None, :, None] + t * camera_direction # batch_size x 3 x n
-        all_points = torch.permute(all_points, (0, 2, 1)) # batch_size x n x 3
-        all_points = torch.reshape(all_points, (-1, 3)) # batch_size*n x 3
-        camera_direction = torch.permute(camera_direction, (0, 2, 1)).reshape(-1, 3) # batch_size*n x 3
-        del t
-        
-        # Positional encoding
-        all_points = self._apply_positional_encoding(all_points, L=10)
-        camera_direction = self._apply_positional_encoding(camera_direction, L=4)
-        input_tensor = torch.concat((all_points, camera_direction), axis=-1) # batch_size*n x 6
-        del all_points
-        del camera_direction
-        
-        # Step 7: Pass input through a model
-        if coarse_network:
-            output_tensor = self.coarse_model(input_tensor) # batch_size*n x 4
-        else:
-            output_tensor = self.fine_model(input_tensor) # batch_size*n x 4
-
-        # Step 8: Pixel reconstruction (Classic Volume Rendering)
-        output_tensor = torch.reshape(output_tensor, (ray_points_num, ray_points.shape[-1], 4)) # batch_size x n x 4
-        output_tensor = torch.permute(output_tensor, (0, 2, 1)) # batch_size x 4 x n
-        sigma = output_tensor[:, 3:4, :] # batch_size x 1 x n
-        delta = (torch.cat([ray_points[:, 1:], torch.ones_like(ray_points[:, 0:1]) * self.t_f], dim=1) - ray_points)[:, None, :] # batch_size x 1 x n
-        T = torch.exp(torch.cumsum(torch.cat([torch.zeros_like(sigma[:, :, 0:1], device=self.device), (-sigma * delta)[:, :, :-1]], dim=-1), dim=-1)) # batch_size x 1 x n
-        c = output_tensor[:, :3, :] # batch_size x 3 x n
-        color_weights = T * (1 - torch.exp(-sigma * delta)) # batch_size x 1 x 60
-        output = torch.sum(color_weights * c, dim=-1) # batch_size x 3
-        # white background
-        acc_map = torch.sum(color_weights, dim=-1) 
-        output = output + (1.0 - acc_map)
-
-        if coarse_network:
-            return output, color_weights.squeeze(1)
-        return output
 
     def _cull_gaussians(self, camera_params):
         pass
 
-    def _duplicate_with_keys(self, means_2d, cov_matrices, z_coords):
-        tails_num = 16
-        def in_tail(tail_idx, center, radius):
-            tile = box((tail_idx % 16) * 16, (tail_idx // 16) * 16, ((tail_idx + 1) % 16) * 16, ((tail_idx // 16) + 1) * 16)
+    def _duplicate_with_keys(self, w, h, means_2d, cov_matrices, z_coords):
+        def in_tile(tile_idx, center, radius):
+            h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
+            h2, w2 = max(h, h2), max(w, w2)
+            tile = box(w1, h1, w2, h2)
             gaussian = Point(center.cpu().detach().numpy()).buffer(radius.cpu().detach().numpy())
             return (tile.intersects(gaussian))
         eigenvalues, _ = torch.linalg.eig(cov_matrices)
         eigenvalues = eigenvalues.real
         max_eigenvalues, _ = eigenvalues.max(dim=1, keepdim=False)
         radiuses = torch.ceil(3 * torch.sqrt(max_eigenvalues))
-        gaussian_lists = []
-        for tail_idx in range(tails_num):
-            gaussian_lists.append([])
+        gaussians_for_tiles = {}
+        for tile_idx in range(self.tiles_num_w * self.tiles_num_h):
+            unsorted_gaussians = []
             for idx, (mean, radius) in enumerate(zip(means_2d, radiuses)):
-                if in_tail(tail_idx, mean, radius):
-                    gaussian_lists.append((idx, z_coords))
-        return gaussian_lists
+                if in_tile(tile_idx, mean, radius):
+                    unsorted_gaussians.append((idx, z_coords[idx]))
+            gaussians_for_tiles[tile_idx] = torch.tensor(sorted(unsorted_gaussians, key=lambda elem : elem[1]), device=self.device)[:, 0].int()
+        return gaussians_for_tiles
 
-    def _sort_by_keys(self, gaussian_lists):
-        new_gaussian_lists = []
-        for gaussian_list in gaussian_lists:
-            new_gaussian_lists.append(sorted(gaussian_list, key=lambda elem : elem[1]))
-        return new_gaussian_lists
-
-    def _identify_tile_ranges(tiles, keys):
-        pass
-
-    def _get_tile_range(self, ranges, tiles):
-        pass
-
-    def _blend_in_order(self, i, indices, ranges, keys):
-        pass
+    def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
+        image = torch.zeros((w, h, 3), device=self.device)
+        for tile_idx, indices in gaussians_for_tiles.items():
+            means_2d_sorted = means_2d[indices]
+            # # for testing
+            A = torch.randn(5000, 2, 2)
+            cov_matrices = A @ A.transpose(-1, -2) + torch.eye(2) * 1e-3 
+            cov_matrices_sorted = cov_matrices[indices.cpu()].cuda()
+            colors = self.colors[indices.cpu()].cuda()
+            opacities = self.opacities[indices.cpu()].cuda()
+            multivariate_normal = torch.distributions.MultivariateNormal(means_2d_sorted, cov_matrices_sorted)
+            h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
+            h2, w2 = min(h, h2), min(w, w2)
+            y, x = torch.meshgrid(
+                torch.arange(h1, h2, device=self.device).float(),
+                torch.arange(w1, w2, device=self.device).float(),
+                indexing="ij"
+            )
+            tile_pixels = torch.stack((y, x), axis=-1)
+            tile_pixels = torch.broadcast_to(tile_pixels, (opacities.shape[0], *tile_pixels.shape))
+            alfas = opacities.transpose(-2, -1) * torch.exp(multivariate_normal.log_prob(tile_pixels.permute(1, 2, 0, 3)))
+            colors = colors.transpose(-2, -1)[None, None, :, :]
+            alfas = alfas[:, :, None, :]
+            transmittance = torch.cumprod(1 - alfas, dim=-1)
+            image[h1:h2, w1:w2, :] = torch.sum(colors * alfas * transmittance, dim=-1)
+        return image
 
     def _project_means(self, w, h, extrinsic_matrix, focal_length):
         intrinsic_matrix = torch.tensor([   
@@ -212,12 +140,9 @@ class GaussianSplattingTrainer(pl.LightningModule):
         # self._cull_gaussians(extrinsic_matrix, focal_length)
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
         cov_matrices = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
-        # tiles = self._create_tiles(w // 16, h // 16)
-        tiles = []
-        gaussian_lists = self._duplicate_with_keys(means_2d, cov_matrices, means_camera[2, :])
-        sorted_gaussians = self._sort_by_keys(gaussian_lists)
-        # for pixel in tiles:
-        #     self._blend_in_order(pixel, indices, range, keys)
+        gaussians_for_tiles = self._duplicate_with_keys(w, h, means_2d, cov_matrices, means_camera[2, :])
+        image = self._blend_in_order(w, h, gaussians_for_tiles, means_2d, cov_matrices)
+        return image
 
     def any_step(self, batch, batch_idx, mode):
         images, poses, focal_lengths = batch
@@ -230,80 +155,39 @@ class GaussianSplattingTrainer(pl.LightningModule):
         image = rgb * alpha + 1.0 * (1.0 - alpha)
 
         output = self._rasterize(image.shape[0], image.shape[1], pose, focal_length)
-        
-        # Step 2-4: Ray casting
-        camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length) # HW x 3
-        camera_direction_vectors_camera_coords = torch.permute(camera_direction_vectors_camera_coords, (1, 0)) # 3 x HW
-        camera_direction_vectors_world_coords = torch.matmul(pose[:3, :3], camera_direction_vectors_camera_coords) # 3 x HW
-        camera_direction_vectors_world_coords = torch.permute(camera_direction_vectors_world_coords, (1, 0)) # HW x 3
-        camera_direction_vectors_world_coords = nn.functional.normalize(camera_direction_vectors_world_coords, dim=1) # HW x 3
-
-        image_flattened = image.reshape(-1, 3) # HW x 3
-    
-        if mode == "train":
-            sampled_indices = torch.randint(0, image.shape[0] * image.shape[1], (self.rays_batch_size,), device=self.device)
-            
-            rays_d_batch = camera_direction_vectors_world_coords[sampled_indices]
-            image_batch = image_flattened[sampled_indices]
-            ray_points_num = self.rays_batch_size
-        else:
-            rays_d_batch = camera_direction_vectors_world_coords
-            image_batch = image_flattened
-            ray_points_num = image.shape[0] * image.shape[1]
-            
-        # Step 5: Ray Marching
-        camera_center = pose[:3, 3] # (3,)
-        coarse_ray_points = self._sample_points_for_coarse_network(ray_points_num) # batch_size x n
-
-        coarse_output, color_weights = self._render_volume(coarse_ray_points, camera_center, rays_d_batch, ray_points_num, coarse_network=True)
-
-        fine_ray_points = self._sample_points_for_fine_network(color_weights)
-        fine_ray_points = torch.cat([coarse_ray_points, fine_ray_points], dim=1)
-        fine_ray_points, _ = torch.sort(fine_ray_points, dim=1)
-        fine_output = self._render_volume(fine_ray_points, camera_center, rays_d_batch, ray_points_num, coarse_network=False)
-
-        # Step 9-10: Loss calculation
-        loss = self.criterion(coarse_output, image_batch) + self.criterion(fine_output, image_batch)
+        loss = (1 - self._lambda) * self.l1_loss(output, image) + self._lambda * (1 - self.ssim(output, image)) / 2
         self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
 
-        return loss, coarse_output, fine_output, image
+        return loss, output, image
 
     def training_step(self, batch, batch_idx):
-        loss, _, _, _ = self.any_step(batch, batch_idx, "train")
+        loss, _, _ = self.any_step(batch, batch_idx, "train")
         
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, coarse_output, fine_output, image = self.any_step(batch, batch_idx, "val")
-        
-        coarse_output = coarse_output.reshape(image.shape[0], image.shape[1], -1)
-        fine_output = fine_output.reshape(image.shape[0], image.shape[1], -1)
+        loss, output, image = self.any_step(batch, batch_idx, "val")
 
-        self.psnr_coarse.update(coarse_output, image)
-        self.psnr_fine.update(fine_output, image)
+        self.psnr.update(output, image)
         
         if self.current_epoch % 100 == 0 and batch_idx == 0:
-            self.log_debug_samples(image, coarse_output, fine_output, "val")
+            self.log_debug_samples(image, output, "val")
 
         return loss
     
     def on_validation_epoch_end(self):
-        psnr_coarse_value = self.psnr_coarse.compute()
+        psnr_coarse_value = self.psnr.compute()
         psnr_fine_value = self.psnr_fine.compute()
 
         self.log("val_psnr_coarse", psnr_coarse_value, on_epoch=True, prog_bar=True)
         self.log("val_psnr_fine", psnr_fine_value, on_epoch=True, prog_bar=True)
     
-    def log_debug_samples(self, img, pred1, pred2, mode):
+    def log_debug_samples(self, img, pred, mode):
         img = img.detach().cpu().permute(2, 0, 1)
-        pred1 = pred1.detach().cpu().permute(2, 0, 1)
-        pred2 = pred2.detach().cpu().permute(2, 0, 1)
+        pred = pred.detach().cpu().permute(2, 0, 1)
 
-        pred1 = torch.clamp(pred1, 0.0, 1.0)
-        pred2 = torch.clamp(pred2, 0.0, 1.0)
-
-        # grid = torch.cat([img, pred], dim=0)
-        grid = torchvision.utils.make_grid([img, pred1, pred2])
+        pred = torch.clamp(pred, 0.0, 1.0)
+        grid = torchvision.utils.make_grid([img, pred])
 
         if self.logger is not None and hasattr(self.logger, "experiment"):
             self.logger.experiment.add_image(f"{mode}_debug_samples", grid, self.current_epoch)
