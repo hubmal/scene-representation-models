@@ -1,3 +1,11 @@
+# CO ZOSTALO:
+# WEKTORYZACJA PRZY SPRAWDZANIU CZY JEST W TILE
+# NAPISANIE RASTERIZERA W TRITONIE
+# CULL_GAUSSIANS
+# SPLIT I POWIELANIE GAUSSIANOW
+# LEPSZA INICJALIZACJA (NA INNYM DATASECIE)
+
+
 import torch
 import torch.nn as nn
 from torch import math
@@ -16,10 +24,10 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
         self.num_points = 5000
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
-        self.scaling_vectors = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
-        self.quaternions = nn.Parameter(torch.rand(self.num_points, 4) * 2 - 1)
+        self.scaling_vectors = nn.Parameter(torch.ones(self.num_points, 3))
+        self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
-        self.opacities = nn.Parameter(torch.rand(self.num_points, 1))
+        self.opacities = nn.Parameter(torch.ones(self.num_points, 1) * 0.1)
         self.tiles_size = 50
         self.tiles_num_h = 4
         self.tiles_num_w = 4
@@ -39,13 +47,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.psnr = PSNR(data_range=1.0)
 
     def configure_optimizers(self):
-        # opt = torch.optim.AdamW(
-        #     list(self.coarse_model.parameters()) + list(self.fine_model.parameters()),
-        #     lr=self.lr,
-        #     weight_decay=self.weight_decay
-        # )
-        # return opt
-        return []
+        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
     def _cull_gaussians(self, camera_params):
         pass
@@ -53,7 +55,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _duplicate_with_keys(self, w, h, means_2d, cov_matrices, z_coords):
         def in_tile(tile_idx, center, radius):
             h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
-            h2, w2 = max(h, h2), max(w, w2)
+            h2, w2 = min(h, h2), min(w, w2)
             tile = box(w1, h1, w2, h2)
             gaussian = Point(center.cpu().detach().numpy()).buffer(radius.cpu().detach().numpy())
             return (tile.intersects(gaussian))
@@ -67,19 +69,17 @@ class GaussianSplattingTrainer(pl.LightningModule):
             for idx, (mean, radius) in enumerate(zip(means_2d, radiuses)):
                 if in_tile(tile_idx, mean, radius):
                     unsorted_gaussians.append((idx, z_coords[idx]))
+            # POPRAWIC GDY DLA TILE PUSTA LISTA
             gaussians_for_tiles[tile_idx] = torch.tensor(sorted(unsorted_gaussians, key=lambda elem : elem[1]), device=self.device)[:, 0].int()
         return gaussians_for_tiles
 
     def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
-        image = torch.zeros((w, h, 3), device=self.device)
+        image = torch.zeros((h, w, 3), device=self.device)
         for tile_idx, indices in gaussians_for_tiles.items():
             means_2d_sorted = means_2d[indices]
-            # # for testing
-            A = torch.randn(5000, 2, 2)
-            cov_matrices = A @ A.transpose(-1, -2) + torch.eye(2) * 1e-3 
             cov_matrices_sorted = cov_matrices[indices.cpu()].cuda()
             colors = self.colors[indices.cpu()].cuda()
-            opacities = self.opacities[indices.cpu()].cuda()
+            opacities = torch.sigmoid(self.opacities[indices.cpu()].cuda())
             multivariate_normal = torch.distributions.MultivariateNormal(means_2d_sorted, cov_matrices_sorted)
             h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
             h2, w2 = min(h, h2), min(w, w2)
@@ -88,12 +88,12 @@ class GaussianSplattingTrainer(pl.LightningModule):
                 torch.arange(w1, w2, device=self.device).float(),
                 indexing="ij"
             )
-            tile_pixels = torch.stack((y, x), axis=-1)
+            tile_pixels = torch.stack((x, y), axis=-1)
             tile_pixels = torch.broadcast_to(tile_pixels, (opacities.shape[0], *tile_pixels.shape))
             alfas = opacities.transpose(-2, -1) * torch.exp(multivariate_normal.log_prob(tile_pixels.permute(1, 2, 0, 3)))
             colors = colors.transpose(-2, -1)[None, None, :, :]
             alfas = alfas[:, :, None, :]
-            transmittance = torch.cumprod(1 - alfas, dim=-1)
+            transmittance = torch.cumprod(torch.cat([torch.ones_like(alfas[:, :, :, 0:1], device=self.device), (1 - alfas)[:, :, :, :-1]], dim=-1), dim=-1)
             image[h1:h2, w1:w2, :] = torch.sum(colors * alfas * transmittance, dim=-1)
         return image
 
@@ -117,8 +117,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
             torch.zeros_like(x_c),
             focal_length / z_c,
             -focal_length * y_c / (z_c * z_c),
-        ]).reshape(-1, 2, 3)
-        return jacobian @ extrinsic_matrix[:3, :3] @ cov_matrices_3d @ extrinsic_matrix[:3, :3].transpose(-2, -1) @ jacobian.transpose(-2, -1)
+        ], dim=-1).reshape(-1, 2, 3)
+        cov_matrices_2d = jacobian @ extrinsic_matrix[:3, :3] @ cov_matrices_3d @ extrinsic_matrix[:3, :3].transpose(-2, -1) @ jacobian.transpose(-2, -1)
+        cov_matrices_2d = (cov_matrices_2d + cov_matrices_2d.transpose(-2, -1)) / 2 # avoid numerical errors - matrix should be symmetric
+        cov_matrices_2d = cov_matrices_2d + 1e-6 * torch.eye(cov_matrices_2d.shape[-1], device=cov_matrices_2d.device) # eigenvalues should not be too small
+        return cov_matrices_2d 
 
     def _create_covariance_matrices(self):
         r, i, j, k = self.quaternions.permute(1, 0)
@@ -132,11 +135,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
             i * k - r * j,
             j * k + r * i,
             1/2 - (i * i + j * j)
-        ]).reshape(-1, 3, 3)
+        ], dim=-1).reshape(-1, 3, 3)
         scaling_matrices = torch.diag_embed(self.scaling_vectors)
         return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
-    def _rasterize(self, w, h, extrinsic_matrix, focal_length):
+    def _rasterize(self, h, w, extrinsic_matrix, focal_length):
         # self._cull_gaussians(extrinsic_matrix, focal_length)
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
         cov_matrices = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
@@ -154,8 +157,12 @@ class GaussianSplattingTrainer(pl.LightningModule):
         alpha = image_rgba[..., 3:4]
         image = rgb * alpha + 1.0 * (1.0 - alpha)
 
-        output = self._rasterize(image.shape[0], image.shape[1], pose, focal_length)
-        loss = (1 - self._lambda) * self.l1_loss(output, image) + self._lambda * (1 - self.ssim(output, image)) / 2
+        extrinsic_matrix = torch.linalg.inv(pose)
+
+        output = self._rasterize(image.shape[0], image.shape[1], extrinsic_matrix, focal_length)
+        output = output.permute(2, 0, 1)
+        image = image.permute(2, 0, 1)
+        loss = (1 - self._lambda) * self.l1_loss(output, image) + self._lambda * (1 - self.ssim(output.unsqueeze(0), image.unsqueeze(0))) / 2
         self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
 
         return loss, output, image
@@ -176,15 +183,12 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss
     
     def on_validation_epoch_end(self):
-        psnr_coarse_value = self.psnr.compute()
-        psnr_fine_value = self.psnr_fine.compute()
-
-        self.log("val_psnr_coarse", psnr_coarse_value, on_epoch=True, prog_bar=True)
-        self.log("val_psnr_fine", psnr_fine_value, on_epoch=True, prog_bar=True)
+        psnr_value = self.psnr.compute()
+        self.log("val_psnr", psnr_value, on_epoch=True, prog_bar=True)
     
     def log_debug_samples(self, img, pred, mode):
-        img = img.detach().cpu().permute(2, 0, 1)
-        pred = pred.detach().cpu().permute(2, 0, 1)
+        img = img.detach().cpu()
+        pred = pred.detach().cpu()
 
         pred = torch.clamp(pred, 0.0, 1.0)
         grid = torchvision.utils.make_grid([img, pred])

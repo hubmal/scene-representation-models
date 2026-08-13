@@ -35,7 +35,8 @@ class NerfTrainer(pl.LightningModule):
             weight_decay=self.weight_decay
         )
         return opt
-    
+
+    # DO POPRAWY!!!
     def _get_camera_direction_vectors(self, image, focal_length):
         H, W = image.shape[:2]
         y, x = torch.meshgrid(
