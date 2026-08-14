@@ -1,5 +1,4 @@
 # CO ZOSTALO:
-# WEKTORYZACJA PRZY SPRAWDZANIU CZY JEST W TILE
 # NAPISANIE RASTERIZERA W TRITONIE
 # CULL_GAUSSIANS
 # SPLIT I POWIELANIE GAUSSIANOW
@@ -10,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch import math
 import pytorch_lightning as pl
+from shapely import STRtree
 from shapely.geometry import box, Point, Polygon
 import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
@@ -53,24 +53,26 @@ class GaussianSplattingTrainer(pl.LightningModule):
         pass
 
     def _duplicate_with_keys(self, w, h, means_2d, cov_matrices, z_coords):
-        def in_tile(tile_idx, center, radius):
+        def in_tile(tile_idx, centers, radiuses):
             h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
             h2, w2 = min(h, h2), min(w, w2)
-            tile = box(w1, h1, w2, h2)
-            gaussian = Point(center.cpu().detach().numpy()).buffer(radius.cpu().detach().numpy())
-            return (tile.intersects(gaussian))
+            tile = [box(w1, h1, w2, h2)]
+            tree_gaussians = [Point(center).buffer(radius) for center, radius in zip(centers.cpu().detach().numpy(), radiuses.cpu().detach().numpy())]
+            tree = STRtree(tree_gaussians)
+            pairs = tree.query(tile, predicate="intersects")
+            return pairs[1, :]
         eigenvalues, _ = torch.linalg.eig(cov_matrices)
         eigenvalues = eigenvalues.real
         max_eigenvalues, _ = eigenvalues.max(dim=1, keepdim=False)
         radiuses = torch.ceil(3 * torch.sqrt(max_eigenvalues))
         gaussians_for_tiles = {}
         for tile_idx in range(self.tiles_num_w * self.tiles_num_h):
-            unsorted_gaussians = []
-            for idx, (mean, radius) in enumerate(zip(means_2d, radiuses)):
-                if in_tile(tile_idx, mean, radius):
-                    unsorted_gaussians.append((idx, z_coords[idx]))
-            # POPRAWIC GDY DLA TILE PUSTA LISTA
-            gaussians_for_tiles[tile_idx] = torch.tensor(sorted(unsorted_gaussians, key=lambda elem : elem[1]), device=self.device)[:, 0].int()
+            indices_list = in_tile(tile_idx, means_2d, radiuses)
+            if len(indices_list) == 0:
+                gaussians_for_tiles[tile_idx] = torch.tensor([], device=self.device)
+            else:
+                indices = torch.tensor(indices_list, device=self.device)
+                gaussians_for_tiles[tile_idx] = indices[torch.argsort(z_coords[indices])]
         return gaussians_for_tiles
 
     def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
