@@ -13,7 +13,7 @@ class NerfTrainer(pl.LightningModule):
         super(NerfTrainer, self).__init__()
         
         # self.coarse_model = MLP()
-        self.coarse_model = MLP(in_location_channels=3, in_direction_channels=3)
+        self.coarse_model = MLP(in_location_channels=60+3, in_direction_channels=24+3)
         # self.fine_model = MLP(in_location_channels=3, in_direction_channels=3)
         # self.fine_model = MLP()
         
@@ -77,7 +77,8 @@ class NerfTrainer(pl.LightningModule):
         x =  torch.pow(2 * torch.ones_like(aranged_L), aranged_L) * math.pi * p[:, :, None]
         sin_basis = torch.sin(x)
         cos_basis = torch.cos(x)
-        out = torch.stack((sin_basis, cos_basis), dim=3).flatten(start_dim=2).flatten(start_dim=1)
+        encoded = torch.stack((sin_basis, cos_basis), dim=3).flatten(start_dim=2).flatten(start_dim=1)
+        out = torch.cat((p, encoded), dim=1)
         return out
     
     def _render_volume(self, ray_points, camera_center, camera_direction, ray_points_num, coarse_network=True):
@@ -91,10 +92,9 @@ class NerfTrainer(pl.LightningModule):
         del t
         
         # Positional encoding
-        # all_points = nn.functional.normalize(all_points, dim=1) # batch_size*n x 3
-        # camera_direction = nn.functional.normalize(camera_direction, dim=1) # batch_size*n x 3
-        # all_points = self._apply_positional_encoding(all_points, L=10)
-        # camera_direction = self._apply_positional_encoding(camera_direction, L=4)
+        camera_direction = nn.functional.normalize(camera_direction, dim=1) # batch_size*n x 3
+        all_points = self._apply_positional_encoding(all_points, L=10)
+        camera_direction = self._apply_positional_encoding(camera_direction, L=4)
         input_tensor = torch.concat((all_points, camera_direction), axis=-1) # batch_size*n x 6
         del all_points
         del camera_direction
@@ -165,18 +165,19 @@ class NerfTrainer(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, coarse_output, fine_output, image = self.any_step(batch, batch_idx, "val")
-        
-        coarse_output = coarse_output.reshape(image.shape[0], image.shape[1], -1)
-        # fine_output = fine_output.reshape(image.shape[0], image.shape[1], -1)
-        fine_output = None
-        self.psnr_coarse.update(coarse_output, image)
-        # self.psnr_fine.update(fine_output, image)
-        
-        if self.current_epoch % 5 == 0 and batch_idx == 0:
-            self.log_debug_samples(image, coarse_output, fine_output, "val")
+        if self.current_epoch % 50 == 0:
+            loss, coarse_output, fine_output, image = self.any_step(batch, batch_idx, "val")
+            
+            coarse_output = coarse_output.reshape(image.shape[0], image.shape[1], -1)
+            # fine_output = fine_output.reshape(image.shape[0], image.shape[1], -1)
+            fine_output = None
+            self.psnr_coarse.update(coarse_output, image)
+            # self.psnr_fine.update(fine_output, image)
+            
+            if self.current_epoch % 5 == 0 and batch_idx == 0:
+                self.log_debug_samples(image, coarse_output, fine_output, "val")
 
-        return loss
+            return loss
     
     def on_validation_epoch_end(self):
         psnr_coarse_value = self.psnr_coarse.compute()

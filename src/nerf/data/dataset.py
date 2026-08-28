@@ -41,7 +41,7 @@ class LegoDataset(Dataset):
                 new_H = original_H // self.downsample_factor
                 image_rgba = image_rgba.resize((new_W, new_H), Image.Resampling.LANCZOS)
 
-            image_rgba = np.array(image_rgba)
+            image_rgba = np.array(image_rgba) / 255.0
             pose = np.array(frame['transform_matrix'])
             
             H, W = image_rgba.shape[:2]
