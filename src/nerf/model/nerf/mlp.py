@@ -52,7 +52,8 @@ class MLP(nn.Module):
         x = self.relu8(x)
         x = self.linear9(x)
         sigma, feature_vector = x[:, 0:1], x[:, 1:]
-        sigma += torch.rand_like(sigma)
+        if self.training:
+            sigma = sigma + torch.randn_like(sigma)
         sigma = self.relu9(sigma)
         x2 = self.linear10(torch.cat([feature_vector, direction_vector], dim=1))
         x2 = self.relu10(x2)
