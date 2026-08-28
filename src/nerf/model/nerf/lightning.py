@@ -14,7 +14,7 @@ class NerfTrainer(pl.LightningModule):
         
         # self.coarse_model = MLP()
         self.coarse_model = MLP(in_location_channels=60+3, in_direction_channels=24+3)
-        # self.fine_model = MLP(in_location_channels=3, in_direction_channels=3)
+        self.fine_model = MLP(in_location_channels=60+3, in_direction_channels=24+3)
         # self.fine_model = MLP()
         
         self.rays_batch_size = 4096
@@ -28,11 +28,11 @@ class NerfTrainer(pl.LightningModule):
         self.weight_decay = 5e-5
 
         self.psnr_coarse = PSNR(data_range=1.0)
-        # self.psnr_fine = PSNR(data_range=1.0)
+        self.psnr_fine = PSNR(data_range=1.0)
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
-            list(self.coarse_model.parameters()), # + list(self.fine_model.parameters()),
+            list(self.coarse_model.parameters()) + list(self.fine_model.parameters()),
             lr=self.lr,
             weight_decay=self.weight_decay
         )
@@ -102,8 +102,8 @@ class NerfTrainer(pl.LightningModule):
         # Step 7: Pass input through a model
         if coarse_network:
             output_tensor = self.coarse_model(input_tensor) # batch_size*n x 4
-        # else:
-        #     output_tensor = self.fine_model(input_tensor) # batch_size*n x 4
+        else:
+            output_tensor = self.fine_model(input_tensor) # batch_size*n x 4
 
         # Step 8: Pixel reconstruction (Classic Volume Rendering)
         output_tensor = torch.reshape(output_tensor, (ray_points_num, ray_points.shape[-1], 4)) # batch_size x n x 4
@@ -147,17 +147,17 @@ class NerfTrainer(pl.LightningModule):
 
         coarse_output, color_weights = self._render_volume(coarse_ray_points, camera_center, rays_d_batch, ray_points_num, coarse_network=True)
 
-        # probs = nn.functional.normalize(color_weights, dim=1)
-        # fine_ray_points = self._sample_points_for_fine_network(coarse_ray_points, probs)
-        # fine_ray_points = torch.cat([coarse_ray_points, fine_ray_points], dim=1)
-        # fine_ray_points, _ = torch.sort(fine_ray_points, dim=1)
-        # fine_output = self._render_volume(fine_ray_points, camera_center, rays_d_batch, ray_points_num, coarse_network=False)
+        probs = nn.functional.normalize(color_weights, dim=1)
+        fine_ray_points = self._sample_points_for_fine_network(coarse_ray_points, probs)
+        fine_ray_points = torch.cat([coarse_ray_points, fine_ray_points], dim=1)
+        fine_ray_points, _ = torch.sort(fine_ray_points, dim=1)
+        fine_output = self._render_volume(fine_ray_points, camera_center, rays_d_batch, ray_points_num, coarse_network=False)
 
         # Step 9-10: Loss calculation
-        loss = self.criterion(coarse_output, image_batch) #+ self.criterion(fine_output, image_batch)
+        loss = self.criterion(coarse_output, image_batch) + self.criterion(fine_output, image_batch)
         self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
 
-        return loss, coarse_output, None, image
+        return loss, coarse_output, fine_output, image
 
     def training_step(self, batch, batch_idx):
         loss, _, _, _ = self.any_step(batch, batch_idx, "train")
@@ -169,10 +169,9 @@ class NerfTrainer(pl.LightningModule):
             loss, coarse_output, fine_output, image = self.any_step(batch, batch_idx, "val")
             
             coarse_output = coarse_output.reshape(image.shape[0], image.shape[1], -1)
-            # fine_output = fine_output.reshape(image.shape[0], image.shape[1], -1)
-            fine_output = None
+            fine_output = fine_output.reshape(image.shape[0], image.shape[1], -1)
             self.psnr_coarse.update(coarse_output, image)
-            # self.psnr_fine.update(fine_output, image)
+            self.psnr_fine.update(fine_output, image)
             
             if self.current_epoch % 5 == 0 and batch_idx == 0:
                 self.log_debug_samples(image, coarse_output, fine_output, "val")
@@ -181,22 +180,22 @@ class NerfTrainer(pl.LightningModule):
     
     def on_validation_epoch_end(self):
         psnr_coarse_value = self.psnr_coarse.compute()
-        # psnr_fine_value = self.psnr_fine.compute()
+        psnr_fine_value = self.psnr_fine.compute()
 
         self.log("val_psnr_coarse", psnr_coarse_value, on_epoch=True, prog_bar=True)
-        # self.log("val_psnr_fine", psnr_fine_value, on_epoch=True, prog_bar=True)
+        self.log("val_psnr_fine", psnr_fine_value, on_epoch=True, prog_bar=True)
     
     def log_debug_samples(self, img, pred1, pred2, mode):
         img = img.detach().cpu().permute(2, 0, 1)
         pred1 = pred1.detach().cpu().permute(2, 0, 1)
-        # pred2 = pred2.detach().cpu().permute(2, 0, 1)
+        pred2 = pred2.detach().cpu().permute(2, 0, 1)
 
         pred1 = torch.clamp(pred1, 0.0, 1.0)
-        # pred2 = torch.clamp(pred2, 0.0, 1.0)
+        pred2 = torch.clamp(pred2, 0.0, 1.0)
 
         # grid = torch.cat([img, pred], dim=0)
-        # grid = torchvision.utils.make_grid([img, pred1, pred2])
-        grid = torchvision.utils.make_grid([img, pred1])
+        grid = torchvision.utils.make_grid([img, pred1, pred2])
+        # grid = torchvision.utils.make_grid([img, pred1])
 
         if self.logger is not None and hasattr(self.logger, "experiment"):
             self.logger.experiment.add_image(f"{mode}_debug_samples", grid, self.current_epoch)
