@@ -1,10 +1,11 @@
-from nerf.train import train_with_clearml
-from nerf.model.nerf.lightning import NerfTrainer
-from nerf.data.lightning import get_datamodule
+from scene_representation.train import train_with_clearml
+from scene_representation.model.nerf.lightning import NerfTrainer
+from scene_representation.data.lightning import get_datamodule
 
 
 train_with_clearml(
-    "simple_nerf",
+    "NeRF",
     NerfTrainer(),
-    get_datamodule()
+    get_datamodule(),
+    max_epochs=3000
 )

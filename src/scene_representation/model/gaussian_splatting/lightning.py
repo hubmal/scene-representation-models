@@ -15,20 +15,19 @@ import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
 from piqa.ssim import SSIM
 
-from nerf.model.gaussian_splatting.pcd import PCD
-
 
 class GaussianSplattingTrainer(pl.LightningModule):
     def __init__(self):
         super(GaussianSplattingTrainer, self).__init__()
 
-        self.num_points = 5000
+        # self.num_points = 5000
+        self.num_points = 100
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
         self.scaling_vectors = nn.Parameter(torch.ones(self.num_points, 3))
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
         self.opacities = nn.Parameter(torch.ones(self.num_points, 1) * 0.1)
-        self.tiles_size = 50
+        self.tiles_size = 25
         self.tiles_num_h = 4
         self.tiles_num_w = 4
         
@@ -150,14 +149,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return image
 
     def any_step(self, batch, batch_idx, mode):
-        images, poses, focal_lengths = batch
-        image_rgba = torch.tensor(images[0, :], device=self.device) # H x W x 4
-        pose = torch.tensor(poses[0, :], device=self.device) # 4 x 4
-        focal_length = torch.tensor(focal_lengths[0], device=self.device) # 1
+        images, poses, focal_lengths, _ = batch
 
-        rgb = image_rgba[..., :3]
-        alpha = image_rgba[..., 3:4]
-        image = rgb * alpha + 1.0 * (1.0 - alpha)
+        image = images[0, ...]
+        pose = poses[0, ...]
+        focal_length = focal_lengths[0, ...]
 
         extrinsic_matrix = torch.linalg.inv(pose)
 

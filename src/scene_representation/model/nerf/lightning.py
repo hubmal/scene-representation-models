@@ -5,17 +5,15 @@ import pytorch_lightning as pl
 import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
 
-from nerf.model.nerf.mlp import MLP
+from scene_representation.model.nerf.mlp import MLP
 
 
 class NerfTrainer(pl.LightningModule):
     def __init__(self):
         super(NerfTrainer, self).__init__()
         
-        # self.coarse_model = MLP()
         self.coarse_model = MLP(in_location_channels=60+3, in_direction_channels=24+3)
         self.fine_model = MLP(in_location_channels=60+3, in_direction_channels=24+3)
-        # self.fine_model = MLP()
         
         self.rays_batch_size = 4096
         self.t_n = 2.0
@@ -37,18 +35,6 @@ class NerfTrainer(pl.LightningModule):
             weight_decay=self.weight_decay
         )
         return opt
-    
-    def _get_camera_direction_vectors(self, image, focal_length):
-        H, W = image.shape[:2]
-        y, x = torch.meshgrid(
-            torch.arange(H, device=self.device).float(),
-            torch.arange(W, device=self.device).float(),
-            indexing="ij"
-        )
-        dirs_x = (x + 0.5 - W // 2) / focal_length
-        dirs_y = -(y + 0.5 - H // 2) / focal_length
-        dirs_z = -torch.ones_like(dirs_x, dtype=torch.float32)
-        return torch.stack((dirs_x, dirs_y, dirs_z), axis=-1).reshape(-1, 3)
     
     def _sample_points_for_coarse_network(self, pixels_num):
         array = torch.linspace(self.t_n, self.t_f, self.n_c + 1, device=self.device)
@@ -81,39 +67,36 @@ class NerfTrainer(pl.LightningModule):
         out = torch.cat((p, encoded), dim=1)
         return out
     
-    def _render_volume(self, ray_points, camera_center, camera_direction, ray_points_num, coarse_network=True):
-        # Step 6: Prepare input for MLP
-        t = torch.broadcast_to(ray_points[:, None, :], (*camera_direction.shape, ray_points.shape[-1])) # batch_size x 3 x n
-        camera_direction = torch.broadcast_to(camera_direction[:, :, None], (*camera_direction.shape, ray_points.shape[-1])) # batch_size x 3 x n
-        all_points = camera_center[None, :, None] + t * camera_direction # batch_size x 3 x n
-        all_points = torch.permute(all_points, (0, 2, 1)) # batch_size x n x 3
-        all_points = torch.reshape(all_points, (-1, 3)) # batch_size*n x 3
-        camera_direction = torch.permute(camera_direction, (0, 2, 1)).reshape(-1, 3) # batch_size*n x 3
-        del t
+    def _synthesize(self, ray_points, camera_center, camera_direction, ray_points_num, coarse_network=True):
+        # Input preparing
+        t = torch.broadcast_to(ray_points[:, None, :], (*camera_direction.shape, ray_points.shape[-1]))
+        camera_direction = torch.broadcast_to(camera_direction[:, :, None], (*camera_direction.shape, ray_points.shape[-1]))
+        all_points = camera_center[None, :, None] + t * camera_direction
+        all_points = torch.permute(all_points, (0, 2, 1))
+        all_points = torch.reshape(all_points, (-1, 3))
+        camera_direction = torch.permute(camera_direction, (0, 2, 1)).reshape(-1, 3)
         
         # Positional encoding
-        camera_direction = nn.functional.normalize(camera_direction, dim=1) # batch_size*n x 3
+        camera_direction = nn.functional.normalize(camera_direction, dim=1)
         all_points = self._apply_positional_encoding(all_points, L=10)
         camera_direction = self._apply_positional_encoding(camera_direction, L=4)
-        input_tensor = torch.concat((all_points, camera_direction), axis=-1) # batch_size*n x 6
-        del all_points
-        del camera_direction
+        input_tensor = torch.concat((all_points, camera_direction), axis=-1)
         
-        # Step 7: Pass input through a model
+        # Passing input through a model
         if coarse_network:
-            output_tensor = self.coarse_model(input_tensor) # batch_size*n x 4
+            output_tensor = self.coarse_model(input_tensor)
         else:
-            output_tensor = self.fine_model(input_tensor) # batch_size*n x 4
+            output_tensor = self.fine_model(input_tensor)
 
-        # Step 8: Pixel reconstruction (Classic Volume Rendering)
-        output_tensor = torch.reshape(output_tensor, (ray_points_num, ray_points.shape[-1], 4)) # batch_size x n x 4
-        output_tensor = torch.permute(output_tensor, (0, 2, 1)) # batch_size x 4 x n
-        sigma = output_tensor[:, 3:4, :] # batch_size x 1 x n
-        delta = (torch.cat([ray_points[:, 1:], torch.ones_like(ray_points[:, 0:1]) * self.t_f], dim=1) - ray_points)[:, None, :] # batch_size x 1 x n
-        T = torch.exp(torch.cumsum(torch.cat([torch.zeros_like(sigma[:, :, 0:1], device=self.device), (-sigma * delta)[:, :, :-1]], dim=-1), dim=-1)) # batch_size x 1 x n
-        c = output_tensor[:, :3, :] # batch_size x 3 x n
-        color_weights = T * (1 - torch.exp(-sigma * delta)) # batch_size x 1 x 60
-        output = torch.sum(color_weights * c, dim=-1) # batch_size x 3
+        # Pixel reconstruction (Classic Volume Rendering)
+        output_tensor = torch.reshape(output_tensor, (ray_points_num, ray_points.shape[-1], 4))
+        output_tensor = torch.permute(output_tensor, (0, 2, 1))
+        sigma = output_tensor[:, 3:4, :]
+        delta = (torch.cat([ray_points[:, 1:], torch.ones_like(ray_points[:, 0:1]) * self.t_f], dim=1) - ray_points)[:, None, :]
+        T = torch.exp(torch.cumsum(torch.cat([torch.zeros_like(sigma[:, :, 0:1], device=self.device), (-sigma * delta)[:, :, :-1]], dim=-1), dim=-1))
+        c = output_tensor[:, :3, :]
+        color_weights = T * (1 - torch.exp(-sigma * delta))
+        output = torch.sum(color_weights * c, dim=-1)
         # white background
         acc_map = torch.sum(color_weights, dim=-1) 
         output = output + (1.0 - acc_map)
@@ -123,7 +106,7 @@ class NerfTrainer(pl.LightningModule):
         return output
 
     def any_step(self, batch, batch_idx, mode):
-        images, poses, focal_lengths, camera_direction_vectors_world_coords = batch
+        images, poses, _, camera_direction_vectors_world_coords = batch
 
         image = images[0, ...]
         pose = poses[0, ...]
@@ -132,7 +115,6 @@ class NerfTrainer(pl.LightningModule):
     
         if mode == "train":
             sampled_indices = torch.randint(0, image.shape[0] * image.shape[1], (self.rays_batch_size,), device=self.device)
-            
             rays_d_batch = camera_direction_vectors_world_coords[sampled_indices]
             image_batch = image_flattened[sampled_indices]
             ray_points_num = self.rays_batch_size
@@ -141,19 +123,15 @@ class NerfTrainer(pl.LightningModule):
             image_batch = image_flattened
             ray_points_num = image.shape[0] * image.shape[1]
             
-        # Step 5: Ray Marching
-        camera_center = pose[:3, 3] # (3,)
-        coarse_ray_points = self._sample_points_for_coarse_network(ray_points_num) # batch_size x n
-
-        coarse_output, color_weights = self._render_volume(coarse_ray_points, camera_center, rays_d_batch, ray_points_num, coarse_network=True)
+        coarse_ray_points = self._sample_points_for_coarse_network(ray_points_num)
+        coarse_output, color_weights = self._synthesize(coarse_ray_points, pose[:3, 3], rays_d_batch, ray_points_num, coarse_network=True)
 
         probs = nn.functional.normalize(color_weights, dim=1)
         fine_ray_points = self._sample_points_for_fine_network(coarse_ray_points, probs)
         fine_ray_points = torch.cat([coarse_ray_points, fine_ray_points], dim=1)
         fine_ray_points, _ = torch.sort(fine_ray_points, dim=1)
-        fine_output = self._render_volume(fine_ray_points, camera_center, rays_d_batch, ray_points_num, coarse_network=False)
+        fine_output = self._synthesize(fine_ray_points, pose[:3, 3], rays_d_batch, ray_points_num, coarse_network=False)
 
-        # Step 9-10: Loss calculation
         loss = self.criterion(coarse_output, image_batch) + self.criterion(fine_output, image_batch)
         self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
 
@@ -186,17 +164,14 @@ class NerfTrainer(pl.LightningModule):
         self.log("val_psnr_fine", psnr_fine_value, on_epoch=True, prog_bar=True)
     
     def log_debug_samples(self, img, pred1, pred2, mode):
-        img = img.detach().cpu().permute(2, 0, 1)
-        pred1 = pred1.detach().cpu().permute(2, 0, 1)
-        pred2 = pred2.detach().cpu().permute(2, 0, 1)
-
-        pred1 = torch.clamp(pred1, 0.0, 1.0)
-        pred2 = torch.clamp(pred2, 0.0, 1.0)
-
-        # grid = torch.cat([img, pred], dim=0)
-        grid = torchvision.utils.make_grid([img, pred1, pred2])
-        # grid = torchvision.utils.make_grid([img, pred1])
-
         if self.logger is not None and hasattr(self.logger, "experiment"):
+            img = img.detach().cpu().permute(2, 0, 1)
+            pred1 = pred1.detach().cpu().permute(2, 0, 1)
+            pred2 = pred2.detach().cpu().permute(2, 0, 1)
+    
+            pred1 = torch.clamp(pred1, 0.0, 1.0)
+            pred2 = torch.clamp(pred2, 0.0, 1.0)
+    
+            grid = torchvision.utils.make_grid([img, pred1, pred2])
             self.logger.experiment.add_image(f"{mode}_debug_samples", grid, self.current_epoch)
     

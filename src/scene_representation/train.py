@@ -7,20 +7,12 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 
-def trainer_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--max_epochs', type=int, default=3000, help='Number of training epochs')
-    args, _ = parser.parse_known_args()
-    return args
-
-
-def train_with_clearml(task_name, model, dm):
-    task = Task.init(task_name=task_name, project_name="Simple Nerf")
-    model = train(model, dm)
+def train_with_clearml(task_name, model, dm, max_epochs):
+    Task.init(task_name=task_name, project_name=task_name)
+    model = train(model, dm, max_epochs)
     return model
 
-
-def train(model, dm, use_early_stopping=True):
+def train(model, dm, max_epochs):
     torch.set_float32_matmul_precision('medium')
 
     logger = TensorBoardLogger("tb_logs", name="my_model")
@@ -31,11 +23,11 @@ def train(model, dm, use_early_stopping=True):
         every_n_epochs=50,
     )
     trainer = Trainer(
-        max_epochs=3000,
+        max_epochs=max_epochs,
         callbacks=[checkpoint_callback],
         accelerator="gpu",
         devices=[0],
-        strategy="ddp_find_unused_parameters_true",
+        # strategy="ddp_find_unused_parameters_true",
         logger=logger
     )
         

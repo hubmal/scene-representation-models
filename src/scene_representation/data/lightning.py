@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
-from nerf.data.dataset import LegoDataset
+from scene_representation.data.dataset import LegoDataset
 
 
 class LegoDataModule(pl.LightningDataModule):

@@ -1,10 +1,11 @@
-from nerf.train import train_with_clearml
-from nerf.model.gaussian_splatting.lightning import GaussianSplattingTrainer
-from nerf.data.lightning import get_datamodule
+from scene_representation.train import train_with_clearml
+from scene_representation.model.gaussian_splatting.lightning import GaussianSplattingTrainer
+from scene_representation.data.lightning import get_datamodule
 
 
 train_with_clearml(
-    "simple_3dgs",
+    "3DGS",
     GaussianSplattingTrainer(),
-    get_datamodule()
+    get_datamodule(downsample_factor=8),
+    max_epochs=50
 )

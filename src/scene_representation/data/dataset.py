@@ -51,17 +51,17 @@ class LegoDataset(Dataset):
             alpha = image_rgba[..., 3:4]
             image = rgb * alpha + 1.0 * (1.0 - alpha)
 
-            camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length)
-            camera_direction_vectors_camera_coords = np.transpose(camera_direction_vectors_camera_coords, (1, 0))
-            camera_direction_vectors_world_coords = np.matmul(pose[:3, :3], camera_direction_vectors_camera_coords)
-            camera_direction_vectors_world_coords = np.transpose(camera_direction_vectors_world_coords, (1, 0))
+            direction_vectors_camera = self._get_camera_direction_vectors(image, focal_length)
+            direction_vectors_camera = np.transpose(direction_vectors_camera, (1, 0))
+            direction_vectors_world = np.matmul(pose[:3, :3], direction_vectors_camera)
+            direction_vectors_world = np.transpose(direction_vectors_world, (1, 0))
 
             np.savez(
                 os.path.join(self.cached_dir, os.path.splitext(os.path.basename(frame['file_path']))[0]),
                 image=image,
                 pose=pose,
                 focal_length=focal_length,
-                camera_direction_vectors_world_coords=camera_direction_vectors_world_coords
+                direction_vectors_world=direction_vectors_world
             )
 
     def _get_camera_direction_vectors(self, image, focal_length):
@@ -79,34 +79,10 @@ class LegoDataset(Dataset):
     def __len__(self):
         return len(self.frames)
 
-    # def __getitem__(self, idx):
-    #     frame = self.frames[idx]
-
-    #     img_name = frame['file_path'].lstrip('./') + ".png"
-    #     img_path = os.path.join(self.root_dir, img_name)
-        
-    #     image = Image.open(img_path).convert("RGBA")
-    #     original_W, original_H = image.size
-        
-    #     if self.downsample_factor > 1:
-    #         new_W = original_W // self.downsample_factor
-    #         new_H = original_H // self.downsample_factor
-    #         image = image.resize((new_W, new_H), Image.Resampling.LANCZOS)
-
-    #     image = self.transform(image)
-    #     image = image.permute(1, 2, 0)
-        
-    #     pose = torch.tensor(frame['transform_matrix'], dtype=torch.float32)
-        
-    #     H, W = image.shape[:2]
-    #     focal_length = 0.5 * W / torch.tan(torch.tensor(0.5 * self.camera_angle_x))
-        
-    #     return image, pose, focal_length
-
     def __getitem__(self, idx):
         data = np.load(os.path.join(self.cached_dir, f"r_{idx}.npz"))
         image = torch.tensor(data["image"], dtype=torch.float32)
         pose = torch.tensor(data["pose"], dtype=torch.float32)
         focal_length = torch.tensor(data["focal_length"], dtype=torch.float32)
-        camera_direction_vectors_world_coords = torch.tensor(data["camera_direction_vectors_world_coords"], dtype=torch.float32)
-        return image, pose, focal_length, camera_direction_vectors_world_coords
+        direction_vectors_world = torch.tensor(data["direction_vectors_world"], dtype=torch.float32)
+        return image, pose, focal_length, direction_vectors_world
