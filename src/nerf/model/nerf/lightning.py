@@ -123,24 +123,12 @@ class NerfTrainer(pl.LightningModule):
         return output
 
     def any_step(self, batch, batch_idx, mode):
-        images, poses, focal_lengths = batch
-        image_rgba = torch.tensor(images[0, :], device=self.device) # H x W x 4
-        pose = torch.tensor(poses[0, :], device=self.device) # 4 x 4
-        focal_length = torch.tensor(focal_lengths[0], device=self.device) # 1
+        images, poses, focal_lengths, camera_direction_vectors_world_coords = batch
 
-        rgb = image_rgba[..., :3]
-        alpha = image_rgba[..., 3:4]
-        image = rgb * alpha + 1.0 * (1.0 - alpha)
-        
-        # Step 2-4: Ray casting
-        camera_direction_vectors_camera_coords = self._get_camera_direction_vectors(image, focal_length) # HW x 3
-        camera_direction_vectors_camera_coords = torch.permute(camera_direction_vectors_camera_coords, (1, 0)) # 3 x HW
-        camera_direction_vectors_world_coords = torch.matmul(pose[:3, :3], camera_direction_vectors_camera_coords) # 3 x HW
-        camera_direction_vectors_world_coords = torch.permute(camera_direction_vectors_world_coords, (1, 0)) # HW x 3
-
-        image_flattened = image.reshape(-1, 3) # HW x 3
-
-        # DOTĄD KOD MOŻNA WYKONYWAĆ TYLKO RAZ - POPRAWKA DO ZWIĘKSZENIA EFEKTYWNOŚCI
+        image = images[0, ...]
+        pose = poses[0, ...]
+        camera_direction_vectors_world_coords = camera_direction_vectors_world_coords[0, ...]
+        image_flattened = image.reshape(-1, 3) 
     
         if mode == "train":
             sampled_indices = torch.randint(0, image.shape[0] * image.shape[1], (self.rays_batch_size,), device=self.device)
