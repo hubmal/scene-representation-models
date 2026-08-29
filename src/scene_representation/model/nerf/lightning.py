@@ -4,6 +4,8 @@ from torch import math
 import pytorch_lightning as pl
 import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity as LPIPS
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
 
 from scene_representation.model.nerf.mlp import MLP
 
@@ -28,6 +30,10 @@ class NerfTrainer(pl.LightningModule):
         self.psnr_coarse = PSNR(data_range=1.0)
         self.psnr_fine = PSNR(data_range=1.0)
 
+        self.test_psnr = PSNR(data_range=1.0)
+        self.test_ssim = SSIM(data_range=1.0)
+        self.test_lpips = LPIPS(normalize=True)
+
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
             list(self.coarse_model.parameters()) + list(self.fine_model.parameters()),
@@ -35,6 +41,14 @@ class NerfTrainer(pl.LightningModule):
             weight_decay=self.weight_decay
         )
         return opt
+
+    def _prepare_for_metrics_calculation(self, x):
+        x = torch.clamp(x, 0.0, 1.0)
+        if x.shape[2] == 1 or x.shape[2] == 3:
+            x = torch.permute(x, (2, 0, 1))
+        if len(x.shape) == 3:
+            x = x.unsqueeze(0)
+        return x
     
     def _sample_points_for_coarse_network(self, pixels_num):
         array = torch.linspace(self.t_n, self.t_f, self.n_c + 1, device=self.device)
@@ -105,6 +119,9 @@ class NerfTrainer(pl.LightningModule):
             return output, color_weights.squeeze(1)
         return output
 
+    def load_state_dict(self, state_dict, strict=True):
+        return super().load_state_dict(state_dict, strict=False)
+    
     def any_step(self, batch, batch_idx, mode):
         images, poses, _, camera_direction_vectors_world_coords = batch
 
@@ -155,6 +172,14 @@ class NerfTrainer(pl.LightningModule):
                 self.log_debug_samples(image, coarse_output, fine_output, "val")
 
             return loss
+
+    def test_step(self, batch, batch_idx):
+        loss, _, output, image = self.any_step(batch, batch_idx, "test")
+        output = output.reshape(image.shape[0], image.shape[1], -1)
+        self.test_psnr.update(output, image)
+        self.test_ssim.update(self._prepare_for_metrics_calculation(output), self._prepare_for_metrics_calculation(image))
+        self.test_lpips.update(self._prepare_for_metrics_calculation(output), self._prepare_for_metrics_calculation(image))
+        return loss
     
     def on_validation_epoch_end(self):
         psnr_coarse_value = self.psnr_coarse.compute()
@@ -162,7 +187,16 @@ class NerfTrainer(pl.LightningModule):
 
         self.log("val_psnr_coarse", psnr_coarse_value, on_epoch=True, prog_bar=True)
         self.log("val_psnr_fine", psnr_fine_value, on_epoch=True, prog_bar=True)
-    
+
+    def on_test_epoch_end(self):
+        test_psnr_value = self.test_psnr.compute()
+        test_ssim_value = self.test_ssim.compute()
+        test_lpips_value = self.test_lpips.compute()
+
+        self.log("test_psnr", test_psnr_value, on_epoch=True, prog_bar=True)
+        self.log("test_ssim", test_ssim_value, on_epoch=True, prog_bar=True)
+        self.log("test_lpips", test_lpips_value, on_epoch=True, prog_bar=True)
+        
     def log_debug_samples(self, img, pred1, pred2, mode):
         if self.logger is not None and hasattr(self.logger, "experiment"):
             img = img.detach().cpu().permute(2, 0, 1)

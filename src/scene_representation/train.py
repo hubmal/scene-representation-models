@@ -27,7 +27,6 @@ def train(model, dm, max_epochs):
         callbacks=[checkpoint_callback],
         accelerator="gpu",
         devices=[0],
-        # strategy="ddp_find_unused_parameters_true",
         logger=logger
     )
         
