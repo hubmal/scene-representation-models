@@ -119,6 +119,18 @@ class NerfTrainer(pl.LightningModule):
             return output, color_weights.squeeze(1)
         return output
 
+    def _render_view(self, rays_d_batch, ray_points_num, pose):
+        coarse_ray_points = self._sample_points_for_coarse_network(ray_points_num)
+        coarse_output, color_weights = self._synthesize(coarse_ray_points, pose[:3, 3], rays_d_batch, ray_points_num, coarse_network=True)
+
+        probs = nn.functional.normalize(color_weights, dim=1)
+        fine_ray_points = self._sample_points_for_fine_network(coarse_ray_points, probs)
+        fine_ray_points = torch.cat([coarse_ray_points, fine_ray_points], dim=1)
+        fine_ray_points, _ = torch.sort(fine_ray_points, dim=1)
+        fine_output = self._synthesize(fine_ray_points, pose[:3, 3], rays_d_batch, ray_points_num, coarse_network=False)
+
+        return coarse_output, fine_output
+
     def load_state_dict(self, state_dict, strict=True):
         return super().load_state_dict(state_dict, strict=False)
     
@@ -135,19 +147,16 @@ class NerfTrainer(pl.LightningModule):
             rays_d_batch = camera_direction_vectors_world_coords[sampled_indices]
             image_batch = image_flattened[sampled_indices]
             ray_points_num = self.rays_batch_size
+            coarse_output, fine_output = self._render_view(rays_d_batch, ray_points_num, pose)
         else:
-            rays_d_batch = camera_direction_vectors_world_coords
-            image_batch = image_flattened
-            ray_points_num = image.shape[0] * image.shape[1]
-            
-        coarse_ray_points = self._sample_points_for_coarse_network(ray_points_num)
-        coarse_output, color_weights = self._synthesize(coarse_ray_points, pose[:3, 3], rays_d_batch, ray_points_num, coarse_network=True)
-
-        probs = nn.functional.normalize(color_weights, dim=1)
-        fine_ray_points = self._sample_points_for_fine_network(coarse_ray_points, probs)
-        fine_ray_points = torch.cat([coarse_ray_points, fine_ray_points], dim=1)
-        fine_ray_points, _ = torch.sort(fine_ray_points, dim=1)
-        fine_output = self._synthesize(fine_ray_points, pose[:3, 3], rays_d_batch, ray_points_num, coarse_network=False)
+            chunk_size = 100 * 100
+            coarse_output = torch.empty_like(camera_direction_vectors_world_coords, device=self.device)
+            fine_output = torch.empty_like(camera_direction_vectors_world_coords, device=self.device)
+            for i in range(0, len(camera_direction_vectors_world_coords), chunk_size):
+                rays_d_batch = camera_direction_vectors_world_coords[i:i+chunk_size, ...]
+                image_batch = image_flattened
+                ray_points_num = chunk_size
+                coarse_output[i:i+chunk_size, ...], fine_output[i:i+chunk_size, ...] = self._render_view(rays_d_batch, ray_points_num, pose)
 
         loss = self.criterion(coarse_output, image_batch) + self.criterion(fine_output, image_batch)
         self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
@@ -160,7 +169,7 @@ class NerfTrainer(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if self.current_epoch % 50 == 0:
+        if self.current_epoch % 300 == 0:
             loss, coarse_output, fine_output, image = self.any_step(batch, batch_idx, "val")
             
             coarse_output = coarse_output.reshape(image.shape[0], image.shape[1], -1)

@@ -6,6 +6,6 @@ from scene_representation.data.lightning import get_datamodule
 train_with_clearml(
     "NeRF",
     NerfTrainer(),
-    get_datamodule(),
+    get_datamodule(downsample_factor=1),
     max_epochs=3000
 )

@@ -10,10 +10,13 @@ import torch.nn as nn
 from torch import math
 import pytorch_lightning as pl
 from shapely import STRtree
-from shapely.geometry import box, Point, Polygon
+from shapely.geometry import box, Point
+from sklearn.neighbors import NearestNeighbors
 import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
 from piqa.ssim import SSIM
+
+from scene_representation.model.gaussian_splatting.utils import inverse_sigmoid
 
 
 class GaussianSplattingTrainer(pl.LightningModule):
@@ -21,12 +24,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
         super(GaussianSplattingTrainer, self).__init__()
 
         # self.num_points = 5000
-        self.num_points = 100
+        self.num_points = 1000
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
-        self.scaling_vectors = nn.Parameter(torch.ones(self.num_points, 3))
+        # self.scaling_vectors = nn.Parameter(torch.ones(self.num_points, 3))
+        self.scaling_vectors = self._initialize_scaling_vectors(self.positions.cpu().detach().numpy())
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
-        self.opacities = nn.Parameter(torch.ones(self.num_points, 1) * 0.1)
+        self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.5))
         self.tiles_size = 25
         self.tiles_num_h = 4
         self.tiles_num_w = 4
@@ -48,6 +52,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
+    def _initialize_scaling_vectors(self, positions):
+        nbrs = NearestNeighbors(n_neighbors=4, algorithm="ball_tree").fit(positions)
+        distances, _ = nbrs.kneighbors(positions)
+        avg_distances = torch.mean(torch.tensor(distances[:, 1:] ** 2, dtype=torch.float32), dim=1)
+        avg_distances = torch.clip(avg_distances, 1e-7, None)
+        return nn.Parameter(torch.log(torch.sqrt(avg_distances[:, None]).repeat(1, 3)))
+
     def _cull_gaussians(self, camera_params):
         pass
 
@@ -63,7 +74,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         eigenvalues, _ = torch.linalg.eig(cov_matrices)
         eigenvalues = eigenvalues.real
         max_eigenvalues, _ = eigenvalues.max(dim=1, keepdim=False)
-        radiuses = torch.ceil(3 * torch.sqrt(max_eigenvalues))
+        radiuses = torch.ceil(2 * torch.sqrt(max_eigenvalues)) # moze do zmiany na 3
         gaussians_for_tiles = {}
         for tile_idx in range(self.tiles_num_w * self.tiles_num_h):
             indices_list = in_tile(tile_idx, means_2d, radiuses)
@@ -96,6 +107,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
             alfas = alfas[:, :, None, :]
             transmittance = torch.cumprod(torch.cat([torch.ones_like(alfas[:, :, :, 0:1], device=self.device), (1 - alfas)[:, :, :, :-1]], dim=-1), dim=-1)
             image[h1:h2, w1:w2, :] = torch.sum(colors * alfas * transmittance, dim=-1)
+        image = torch.clamp(image, 0.0, 1.0)
         return image
 
     def _project_means(self, w, h, extrinsic_matrix, focal_length):
@@ -122,7 +134,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         cov_matrices_2d = jacobian @ extrinsic_matrix[:3, :3] @ cov_matrices_3d @ extrinsic_matrix[:3, :3].transpose(-2, -1) @ jacobian.transpose(-2, -1)
         cov_matrices_2d = (cov_matrices_2d + cov_matrices_2d.transpose(-2, -1)) / 2 # avoid numerical errors - matrix should be symmetric
         cov_matrices_2d = cov_matrices_2d + 1e-6 * torch.eye(cov_matrices_2d.shape[-1], device=cov_matrices_2d.device) # eigenvalues should not be too small
-        return cov_matrices_2d 
+        return cov_matrices_2d, cov_matrices_3d 
 
     def _create_covariance_matrices(self):
         r, i, j, k = self.quaternions.permute(1, 0)
@@ -137,14 +149,19 @@ class GaussianSplattingTrainer(pl.LightningModule):
             j * k + r * i,
             1/2 - (i * i + j * j)
         ], dim=-1).reshape(-1, 3, 3)
-        scaling_matrices = torch.diag_embed(self.scaling_vectors)
+        scaling_matrices = torch.diag_embed(torch.exp(self.scaling_vectors))
         return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
     def _rasterize(self, h, w, extrinsic_matrix, focal_length):
         # self._cull_gaussians(extrinsic_matrix, focal_length)
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
-        cov_matrices = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
+        # self._if_uniform_3d_gaussians(self.positions)
+        # self.debug_means(self.positions, means_2d, means_camera, extrinsic_matrix)
+        cov_matrices, cov_matrices_3d = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
+        # self.debug_covariances(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d)
         gaussians_for_tiles = self._duplicate_with_keys(w, h, means_2d, cov_matrices, means_camera[2, :])
+        # for i, (_, gaussian) in enumerate(gaussians_for_tiles.items()):
+        #     self.debug_covariances_in_tiles(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d, gaussian, i)
         image = self._blend_in_order(w, h, gaussians_for_tiles, means_2d, cov_matrices)
         return image
 
@@ -175,7 +192,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
         self.psnr.update(output, image)
         
-        if self.current_epoch % 100 == 0 and batch_idx == 0:
+        if batch_idx == 0:
             self.log_debug_samples(image, output, "val")
 
         return loss
@@ -193,4 +210,237 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
         if self.logger is not None and hasattr(self.logger, "experiment"):
             self.logger.experiment.add_image(f"{mode}_debug_samples", grid, self.current_epoch)
+
+    def _if_uniform_3d_gaussians(self, positions):
+        import matplotlib.pyplot as plt
+        import os
+
+        w, h = 400, 400
+        focal_length = 300.0
+
+        # --- plot ---------------------------------------------------------------
+        fig = plt.figure(figsize=(11, 5))
+
+        import numpy as np
+        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+        ax3d.scatter(*zip(*positions.tolist()), s=60)
+        for pos in positions.tolist():
+            ax3d.text(*pos, "")
+        # ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--", label="optical axis")
+        ax3d.set_xlabel("x")
+        ax3d.set_ylabel("y")
+        ax3d.set_zlabel("z")
+        ax3d.set_title("3D scene")
+        ax3d.legend()
+
+        ax2d = fig.add_subplot(1, 2, 2)
+        ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
+        ax2d.set_xlim(-0.2 * w, 1.2 * w)
+        ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
+        ax2d.set_xlabel("u (pixels)")
+        ax2d.set_ylabel("v (pixels)")
+        ax2d.set_title("2D projection (image plane)")
+        ax2d.set_aspect("equal")
+
+        fig.tight_layout()
+        os.makedirs("outputs", exist_ok=True)
+        out_path = os.path.join("outputs", "means_3d.png")
+        fig.savefig(out_path, dpi=150)
+        print(f"saved figure to {out_path}")
+        plt.show()
+
+        print(positions)
+            
+    def debug_means(self, positions, means_2d, means_camera, extrinsic_matrix):
+
+        import matplotlib.pyplot as plt
+        import os
+        colors = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple"]
+
+        w, h = 100, 100
+        focal_length = 300.0
+
+        # --- run the function under test --------------------------------------
+        means_2d = means_2d.cpu().detach().numpy()[:5]
+        depths = means_camera[2].cpu().detach().numpy()[:5]  # camera-space z (depth) per point
+        means_camera = means_camera.permute(1, 0).cpu().detach().numpy()[:5]
+
+        # --- plot ---------------------------------------------------------------
+        fig = plt.figure(figsize=(11, 5))
+
+        R = extrinsic_matrix[:3, :3]
+        T = extrinsic_matrix[:3, 3]
+        camera_pos = -torch.matmul(torch.linalg.inv(R), T)
+        camera_pos = camera_pos.cpu().detach().numpy()
+        import numpy as np
+        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+        positions = positions
+        ax3d.scatter(*zip(*means_camera.tolist()), c=colors, s=60)
+        for pos in means_camera.tolist():
+            ax3d.text(*pos, "")
+        ax3d.scatter(0, 0, 0, c="black", marker="^", s=100, label="camera")
+        # ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--", label="optical axis")
+        ax3d.set_xlabel("x")
+        ax3d.set_ylabel("y")
+        ax3d.set_zlabel("z")
+        ax3d.set_title("3D scene")
+        ax3d.legend()
+
+        ax2d = fig.add_subplot(1, 2, 2)
+        ax2d.scatter(means_2d[:, 0], means_2d[:, 1], c=colors, s=60)
+        ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
+        ax2d.set_xlim(-0.2 * w, 1.2 * w)
+        ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
+        ax2d.set_xlabel("u (pixels)")
+        ax2d.set_ylabel("v (pixels)")
+        ax2d.set_title("2D projection (image plane)")
+        ax2d.set_aspect("equal")
+
+        fig.tight_layout()
+        os.makedirs("outputs", exist_ok=True)
+        out_path = os.path.join("outputs", "project_means.png")
+        fig.savefig(out_path, dpi=150)
+        print(f"saved figure to {out_path}")
+        plt.show()
+
+        print("camera-space depth (z_c) per gaussian:", depths)
+        # print(F"COLORS: {colors}")
+        print(f"Means positions in camera system: {means_camera}")
+        print(f"Camera position in world system: {camera_pos}")
+        print(f"Means positions in 2D: {means_2d}")
+
+
+    def debug_covariances(self, positions, means_2d, means_camera, extrinsic_matrix, cov_matrices_2d, cov_matrices_3d):
+            import matplotlib.pyplot as plt
+            import os
+            from scene_representation.model.gaussian_splatting.utils import ellipsoid_surface, ellipse_points
+            colors = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple"]
     
+            w, h = 100, 100
+            focal_length = 300.0
+    
+            # --- run the function under test --------------------------------------
+            means_2d = means_2d[:5]
+            depths = means_camera[2].cpu().detach().numpy()[:5]  # camera-space z (depth) per point
+            means_camera = means_camera.permute(1, 0).cpu().detach().numpy()[:5]
+            cov_matrices_2d = cov_matrices_2d[:5]
+            cov_matrices_3d = cov_matrices_3d[:5]
+
+            R = extrinsic_matrix[:3, :3]
+            T = extrinsic_matrix[:3, 3]
+            camera_pos = -torch.matmul(torch.linalg.inv(R), T)
+            camera_pos = camera_pos.cpu().detach().numpy()
+            target = (0.0, 0.0, 0.0)
+            # --- plot ---------------------------------------------------------------
+            fig = plt.figure(figsize=(11, 5))
+
+            ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+            for mean, cov, c in zip(positions, cov_matrices_3d, colors):
+                X, Y, Z = ellipsoid_surface(mean, cov, n_std=2.0)
+                ax3d.plot_wireframe(X, Y, Z, color=c, alpha=0.5, linewidth=0.5, rstride=2, cstride=2)
+                ax3d.scatter(*mean.tolist(), c=c, s=20)
+            ax3d.scatter(*camera_pos, c="black", marker="^", s=100, label="camera")
+            ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--")
+            ax3d.set_xlabel("x")
+            ax3d.set_ylabel("y")
+            ax3d.set_zlabel("z")
+            ax3d.set_title("3D gaussians (2-std ellipsoids)")
+    
+    
+            ax2d = fig.add_subplot(1, 2, 2)
+            ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
+            for mean2d, cov2d, c in zip(means_2d, cov_matrices_2d, colors):
+                ex, ey = ellipse_points(mean2d, cov2d, n_std=2.0)
+                ax2d.plot(ex, ey, color=c)
+                ax2d.scatter(*mean2d.tolist(), c=c, s=20)
+            ax2d.set_xlim(-0.2 * w, 1.2 * w)
+            ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
+            ax2d.set_xlabel("u (pixels)")
+            ax2d.set_ylabel("v (pixels)")
+            ax2d.set_title("projected 2-std ellipses")
+            ax2d.set_aspect("equal")
+            ax2d.legend(fontsize=8, loc="upper right")
+    
+            fig.tight_layout()
+            os.makedirs("outputs", exist_ok=True)
+            out_path = os.path.join("outputs", "project_covariances.png")
+            fig.savefig(out_path, dpi=150)
+            print(f"saved figure to {out_path}")
+            plt.show()
+    
+            # print("camera-space depth (z_c) per gaussian:", depths)
+            # print(F"COLORS: {colors}")
+            # print(f"Means positions in camera system: {means_camera}")
+            # print(f"Camera position in world system: {camera_pos}")
+            # print(f"Means positions in 2D: {means_2d}")
+
+            print(cov_matrices_3d)
+            print(cov_matrices_2d)
+            print(self.scaling_vectors[:5])
+    def debug_covariances_in_tiles(self, positions, means_2d, means_camera, extrinsic_matrix, cov_matrices_2d, cov_matrices_3d, indices, i):
+        import matplotlib.pyplot as plt
+        import os
+        from scene_representation.model.gaussian_splatting.utils import ellipsoid_surface, ellipse_points
+        # colors = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple"]
+
+        w, h = 100, 100
+        focal_length = 300.0
+
+        # --- run the function under test --------------------------------------
+        means_2d = means_2d[indices]
+        # depths = means_camera[2].cpu().detach().numpy()[:5]  # camera-space z (depth) per point
+        # means_camera = means_camera.permute(1, 0).cpu().detach().numpy()[:5]
+        cov_matrices_2d = cov_matrices_2d[indices]
+        cov_matrices_3d = cov_matrices_3d[indices]
+
+        R = extrinsic_matrix[:3, :3]
+        T = extrinsic_matrix[:3, 3]
+        camera_pos = -torch.matmul(torch.linalg.inv(R), T)
+        camera_pos = camera_pos.cpu().detach().numpy()
+        target = (0.0, 0.0, 0.0)
+        # --- plot ---------------------------------------------------------------
+        fig = plt.figure(figsize=(11, 5))
+
+        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+        for mean, cov in zip(positions, cov_matrices_3d):
+            X, Y, Z = ellipsoid_surface(mean, cov, n_std=2.0)
+            ax3d.plot_wireframe(X, Y, Z, alpha=0.5, linewidth=0.5, rstride=2, cstride=2)
+            ax3d.scatter(*mean.tolist(), s=20)
+        ax3d.scatter(*camera_pos, c="black", marker="^", s=100, label="camera")
+        ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--")
+        ax3d.set_xlabel("x")
+        ax3d.set_ylabel("y")
+        ax3d.set_zlabel("z")
+        ax3d.set_title("3D gaussians (2-std ellipsoids)")
+
+
+        ax2d = fig.add_subplot(1, 2, 2)
+        ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
+        for mean2d, cov2d in zip(means_2d, cov_matrices_2d):
+            ex, ey = ellipse_points(mean2d, cov2d, n_std=2.0)
+            ax2d.plot(ex, ey)
+            ax2d.scatter(*mean2d.tolist(), s=20)
+        ax2d.set_xlim(-0.2 * w, 1.2 * w)
+        ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
+        ax2d.set_xlabel("u (pixels)")
+        ax2d.set_ylabel("v (pixels)")
+        ax2d.set_title("projected 2-std ellipses")
+        ax2d.set_aspect("equal")
+        ax2d.legend(fontsize=8, loc="upper right")
+
+        fig.tight_layout()
+        os.makedirs("outputs", exist_ok=True)
+        out_path = os.path.join("outputs", f"project_covariances_tiles_{i}.png")
+        fig.savefig(out_path, dpi=150)
+        print(f"saved figure to {out_path}")
+        plt.show()
+
+        # print("camera-space depth (z_c) per gaussian:", depths)
+        # print(F"COLORS: {colors}")
+        # print(f"Means positions in camera system: {means_camera}")
+        # print(f"Camera position in world system: {camera_pos}")
+        # print(f"Means positions in 2D: {means_2d}")
+
+        print(cov_matrices_3d)
+        print(cov_matrices_2d)
+        print(self.scaling_vectors[:5])

@@ -10,6 +10,6 @@ args = parser.parse_args()
 
 test(
     NerfTrainer,
-    get_datamodule(),
+    get_datamodule(downsample_factor=1),
     args.ckpt_path
 )
