@@ -9,7 +9,7 @@ Due to limited computational resources, training and testing were performed on d
 | Source      | Resolution |  PSNR  |  SSIM  | LPIPS |
 |-------------|:----------:|:------:|:------:|:-----:|
 | Paper       | 800x800    | 32.54  | 0.961  | 0.050 |
-| My results  | 200x200    |        |        |       |
+| My results  | 800x800    | 32.08  | 0.962  | 0.022 |
 
 ## Implemented
 
@@ -18,9 +18,8 @@ NERF:
 - [x] Positional encoding
 - [x] View dependence
 - [x] Hierarchical sampling
-
+- [x] Reproduce results on the LEGO scenes
 TODO:
-- [ ] Reproduce results on the original NeRF paper's scenes
 - [ ] Support for non-synthetic scenes
 
 Gaussian Splatting:
