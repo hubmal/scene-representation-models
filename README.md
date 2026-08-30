@@ -6,10 +6,10 @@ Implementations of NeRF and Gaussian Splatting algoritms from scratch using Pyto
 
 Due to limited computational resources, training and testing were performed on downsampled images. Specifically, for the LEGO dataset, the resolution used was 200x200.
 
-| Source      | Resolution |  PSNR  |  SSIM  | LPIPS |
-|-------------|:----------:|:------:|:------:|:-----:|
-| Paper       | 800x800    | 32.54  | 0.961  | 0.050 |
-| My results  | 800x800    | 32.08  | 0.962  | 0.022 |
+| Method | Source      | Resolution |  PSNR  |  SSIM  | LPIPS |
+|--------|-------------|:----------:|:------:|:------:|:-----:|
+| NeRF   | Paper       | 800x800    | 32.54  | 0.961  | 0.050 |
+| NeRF   | My results  | 800x800    | 32.08  | 0.962  | 0.022 |
 
 ## Implemented
 
