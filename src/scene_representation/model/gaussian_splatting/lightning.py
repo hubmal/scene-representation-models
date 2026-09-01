@@ -30,10 +30,15 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.scaling_vectors = self._initialize_scaling_vectors(self.positions.cpu().detach().numpy())
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
-        self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.5))
+        # self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.5))
+        self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.005 +  torch.randn(self.num_points, 1) * 0.0001))
         self.tiles_size = 25
         self.tiles_num_h = 4
         self.tiles_num_w = 4
+        self.pruning_threshold = 0.005
+        self.densification_interval = 100
+        self.pos_grad_threshold = 2e-4
+        self.scale_divisor = 1.6
         
         self.rays_batch_size = 4096
         self.t_n = 2.0
@@ -60,6 +65,45 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return nn.Parameter(torch.log(torch.sqrt(avg_distances[:, None]).repeat(1, 3)))
 
     def _cull_gaussians(self, camera_params):
+        pass
+
+    def _prune_gaussians(self):
+        if self.current_epoch < 1:
+            return
+        def prune(params, index, optimizer):
+            stored_state = optimizer.state.get(params, None)  
+            if stored_state:
+                stored_state["exp_avg"] = stored_state["exp_avg"][indices]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][indices]
+                del optimizer.state[params]
+                params = nn.Parameter(
+                    (params[indices].detach().requires_grad_(True))
+                )
+                optimizer.state[params] = stored_state
+            else:
+                params = nn.Parameter(
+                    (params[indices].detach().requires_grad_(True))
+                )
+            optimizer.param_groups[0]["params"][index] = params
+            return params
+        
+        indices = torch.argwhere(torch.sigmoid(self.opacities) >= self.pruning_threshold)[:, 0]
+        optimizer = self.optimizers().optimizer
+
+        self.positions = prune(self.positions, 0, optimizer)
+        self.scaling_vectors = prune(self.scaling_vectors, 1, optimizer)
+        self.quaternions = prune(self.quaternions, 2, optimizer)
+        self.colors = prune(self.colors, 3, optimizer)
+        self.opacities = prune(self.opacities, 4, optimizer)
+
+
+    def _split_gaussians(self):
+        pass
+
+    def _clone_gaussians(self):
+        pass
+
+    def _densify_gaussians(self):
         pass
 
     def _duplicate_with_keys(self, w, h, means_2d, cov_matrices, z_coords):
@@ -174,6 +218,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
         extrinsic_matrix = torch.linalg.inv(pose)
 
+        # if self.global_step % self.densification_interval == 0:
+        #     self._densify_gaussians()
         output = self._rasterize(image.shape[0], image.shape[1], extrinsic_matrix, focal_length)
         output = output.permute(2, 0, 1)
         image = image.permute(2, 0, 1)
@@ -196,6 +242,10 @@ class GaussianSplattingTrainer(pl.LightningModule):
             self.log_debug_samples(image, output, "val")
 
         return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        self._prune_gaussians()
+        return super().on_train_batch_end(outputs, batch, batch_idx)
     
     def on_validation_epoch_end(self):
         psnr_value = self.psnr.compute()
