@@ -24,7 +24,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         super(GaussianSplattingTrainer, self).__init__()
 
         # self.num_points = 5000
-        self.num_points = 1000
+        self.num_points = 5
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
         # self.scaling_vectors = nn.Parameter(torch.ones(self.num_points, 3))
         self.scaling_vectors = self._initialize_scaling_vectors(self.positions.cpu().detach().numpy())
@@ -37,7 +37,10 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.tiles_num_w = 4
         self.pruning_threshold = 0.005
         self.densification_interval = 100
-        self.pos_grad_threshold = 2e-4
+        self.pos_grad_threshold = 1e-9
+        # self.pos_grad_threshold = 2e-4
+        # self.max_scale_threshold = 0.01
+        self.max_scale_threshold = 0.1
         self.scale_divisor = 1.6
         
         self.rays_batch_size = 4096
@@ -70,7 +73,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _prune_gaussians(self):
         if self.current_epoch < 1:
             return
-        def prune(params, index, optimizer):
+        def prune(params, index, optimizer, indices):
             stored_state = optimizer.state.get(params, None)  
             if stored_state:
                 stored_state["exp_avg"] = stored_state["exp_avg"][indices]
@@ -90,21 +93,94 @@ class GaussianSplattingTrainer(pl.LightningModule):
         indices = torch.argwhere(torch.sigmoid(self.opacities) >= self.pruning_threshold)[:, 0]
         optimizer = self.optimizers().optimizer
 
-        self.positions = prune(self.positions, 0, optimizer)
-        self.scaling_vectors = prune(self.scaling_vectors, 1, optimizer)
-        self.quaternions = prune(self.quaternions, 2, optimizer)
-        self.colors = prune(self.colors, 3, optimizer)
-        self.opacities = prune(self.opacities, 4, optimizer)
+        self.positions = prune(self.positions, 0, optimizer, indices)
+        self.scaling_vectors = prune(self.scaling_vectors, 1, optimizer, indices)
+        self.quaternions = prune(self.quaternions, 2, optimizer, indices)
+        self.colors = prune(self.colors, 3, optimizer, indices)
+        self.opacities = prune(self.opacities, 4, optimizer, indices)
 
 
-    def _split_gaussians(self):
-        pass
+    def _split_gaussians(self, indices):
+        def split(params, index, optimizer, indices, scaling=False):
+            cloned_params = params.clone().detach()
+            new_params = params[indices].clone().detach()
+            if scaling:
+                new_params /= self.scale_divisor
+                cloned_params[indices] = new_params
+            params = torch.cat([new_params.clone().detach(), cloned_params], dim=0)
+            stored_state = optimizer.state.get(params, None)  
+            if stored_state:
+                stored_state["exp_avg"] = torch.cat([stored_state["exp_avg"], stored_state["exp_avg"][indices]], dim=0)
+                stored_state["exp_avg_sq"] = torch.cat([stored_state["exp_avg_sq"], stored_state["exp_avg_sq"][indices]], dim=0)
+                del optimizer.state[params]
+                params = nn.Parameter(
+                    (params.detach().requires_grad_(True))
+                )
+                optimizer.state[params] = stored_state
+            else:
+                params = nn.Parameter(
+                    (params.detach().requires_grad_(True))
+                )
+            optimizer.param_groups[0]["params"][index] = params
+            return params
+        
+        optimizer = self.optimizers().optimizer
+        self.positions = split(self.positions, 0, optimizer, indices)
+        self.scaling_vectors = split(self.scaling_vectors, 1, optimizer, indices, scaling=True)
+        self.quaternions = split(self.quaternions, 2, optimizer, indices)
+        self.colors = split(self.colors, 3, optimizer, indices)
+        self.opacities = split(self.opacities, 4, optimizer, indices)
 
-    def _clone_gaussians(self):
-        pass
+    def _clone_gaussians(self, indices, grad):
+        def cloned(params, index, optimizer, indices, grad=None):
+            if grad is not None:
+                cloned_params = torch.cat([params.clone().detach(), params[indices].clone().detach() + grad[indices]], dim=0)
+            else:
+                cloned_params = torch.cat([params.clone().detach(), params[indices].clone().detach()], dim=0)
+            stored_state = optimizer.state.get(params, None)  
+            if stored_state:
+                stored_state["exp_avg"] = torch.cat([stored_state["exp_avg"], stored_state["exp_avg"][indices]], dim=0)
+                stored_state["exp_avg_sq"] = torch.cat([stored_state["exp_avg_sq"], stored_state["exp_avg_sq"][indices]], dim=0)
+                del optimizer.state[params]
+                params = nn.Parameter(
+                    (cloned_params.detach().requires_grad_(True))
+                )
+                optimizer.state[cloned_params] = stored_state
+            else:
+                params = nn.Parameter(
+                    (cloned_params.detach().requires_grad_(True))
+                )
+            optimizer.param_groups[0]["params"][index] = params
+            return params
+        
+        optimizer = self.optimizers().optimizer
+        self.positions = cloned(self.positions, 0, optimizer, indices, grad)
+        self.scaling_vectors = cloned(self.scaling_vectors, 1, optimizer, indices)
+        self.quaternions = cloned(self.quaternions, 2, optimizer, indices)
+        self.colors = cloned(self.colors, 3, optimizer, indices)
+        self.opacities = cloned(self.opacities, 4, optimizer, indices)
 
     def _densify_gaussians(self):
-        pass
+        if self.current_epoch < 1:
+            return
+        optimizer = self.optimizers().optimizer
+        grad = optimizer.param_groups[0]["params"][0].grad
+        over_recon_indices = torch.argwhere(
+            torch.logical_and(
+                torch.linalg.vector_norm(grad, dim=1) > self.pos_grad_threshold,
+                torch.abs(torch.max(self.scaling_vectors, dim=1)[0]) > self.max_scale_threshold
+            )
+        ).flatten()        
+        under_recon_indices = torch.argwhere(
+            torch.logical_and(
+                torch.linalg.vector_norm(grad, dim=1) > self.pos_grad_threshold,
+                torch.abs(torch.max(self.scaling_vectors, dim=1)[0]) <= self.max_scale_threshold
+            )
+        ).flatten()
+        if len(over_recon_indices) != 0:
+            self._split_gaussians(over_recon_indices)
+        if len(under_recon_indices) != 0:
+            self._clone_gaussians(under_recon_indices, grad)
 
     def _duplicate_with_keys(self, w, h, means_2d, cov_matrices, z_coords):
         def in_tile(tile_idx, centers, radiuses):
@@ -229,11 +305,15 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss, output, image
 
     def training_step(self, batch, batch_idx):
+        if batch_idx > 5:
+            return
         loss, _, _ = self.any_step(batch, batch_idx, "train")
         
         return loss
 
     def validation_step(self, batch, batch_idx):
+        if batch_idx > 5:
+            return
         loss, output, image = self.any_step(batch, batch_idx, "val")
 
         self.psnr.update(output, image)
@@ -244,7 +324,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        self._prune_gaussians()
+        self._densify_gaussians()
+        # self._prune_gaussians()
         return super().on_train_batch_end(outputs, batch, batch_idx)
     
     def on_validation_epoch_end(self):
