@@ -101,9 +101,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
 
     def _split_gaussians(self, indices):
-        def split(params, index, optimizer, indices, scaling=False):
+        def split(params, index, optimizer, indices, sampling=False, scaling=False):
             cloned_params = params.clone().detach()
             new_params = params[indices].clone().detach()
+            if sampling:
+                cov_matrices = self._create_covariance_matrices()[indices]
+                multivariate_normal = torch.distributions.MultivariateNormal(new_params, cov_matrices)
+                new_params = torch.clip(multivariate_normal.sample((1,)).squeeze(0), -1.0, 1.0)
             if scaling:
                 new_params /= self.scale_divisor
                 cloned_params[indices] = new_params
@@ -125,7 +129,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
             return params
         
         optimizer = self.optimizers().optimizer
-        self.positions = split(self.positions, 0, optimizer, indices)
+        self.positions = split(self.positions, 0, optimizer, indices, sampling=True)
         self.scaling_vectors = split(self.scaling_vectors, 1, optimizer, indices, scaling=True)
         self.quaternions = split(self.quaternions, 2, optimizer, indices)
         self.colors = split(self.colors, 3, optimizer, indices)
