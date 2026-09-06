@@ -4,10 +4,9 @@
 # SPLIT I POWIELANIE GAUSSIANOW
 # LEPSZA INICJALIZACJA (NA INNYM DATASECIE)
 
-
+import math
 import torch
 import torch.nn as nn
-from torch import math
 import pytorch_lightning as pl
 from shapely import STRtree
 from shapely.geometry import box, Point
@@ -24,30 +23,21 @@ class GaussianSplattingTrainer(pl.LightningModule):
         super(GaussianSplattingTrainer, self).__init__()
 
         # self.num_points = 5000
-        self.num_points = 5
+        self.num_points = 500
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
-        # self.scaling_vectors = nn.Parameter(torch.ones(self.num_points, 3))
         self.scaling_vectors = self._initialize_scaling_vectors(self.positions.cpu().detach().numpy())
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
-        # self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.5))
-        self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.005 +  torch.randn(self.num_points, 1) * 0.0001))
+        self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.1))
         self.tiles_size = 25
         self.tiles_num_h = 4
         self.tiles_num_w = 4
         self.pruning_threshold = 0.005
         self.densification_interval = 100
-        self.pos_grad_threshold = 1e-9
-        # self.pos_grad_threshold = 2e-4
-        # self.max_scale_threshold = 0.01
-        self.max_scale_threshold = 0.1
+        self.decreasing_alpha_interval = 300
+        self.pos_grad_threshold = 2e-4
+        self.max_scale_threshold = 0.01
         self.scale_divisor = 1.6
-        
-        self.rays_batch_size = 4096
-        self.t_n = 2.0
-        self.t_f = 6.0
-        self.n_c = 64
-        self.n_f = 124
         
         self.l1_loss = nn.L1Loss()
         self.ssim = SSIM()
@@ -58,7 +48,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.psnr = PSNR(data_range=1.0)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return torch.optim.AdamW([
+        {"params": [self.positions], "lr": 1.6e-4, "weight_decay": 1.6e-6},
+        {"params": [self.scaling_vectors], "lr": 5e-3, "weight_decay": 0},
+        {"params": [self.quaternions], "lr": 1e-3, "weight_decay": 0},
+        {"params": [self.colors], "lr": 2.5e-3, "weight_decay": 0},
+        {"params": [self.opacities], "lr": 5e-2, "weight_decay": 0},
+    ])
 
     def _initialize_scaling_vectors(self, positions):
         nbrs = NearestNeighbors(n_neighbors=4, algorithm="ball_tree").fit(positions)
@@ -74,6 +70,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         if self.current_epoch < 1:
             return
         def prune(params, index, optimizer, indices):
+            stored_grad = params.grad
             stored_state = optimizer.state.get(params, None)  
             if stored_state:
                 stored_state["exp_avg"] = stored_state["exp_avg"][indices]
@@ -87,7 +84,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
                 params = nn.Parameter(
                     (params[indices].detach().requires_grad_(True))
                 )
-            optimizer.param_groups[0]["params"][index] = params
+            params.grad = stored_grad[indices]
+            optimizer.param_groups[index]["params"][0] = params
             return params
         
         indices = torch.argwhere(torch.sigmoid(self.opacities) >= self.pruning_threshold)[:, 0]
@@ -107,25 +105,25 @@ class GaussianSplattingTrainer(pl.LightningModule):
             if sampling:
                 cov_matrices = self._create_covariance_matrices()[indices]
                 multivariate_normal = torch.distributions.MultivariateNormal(new_params, cov_matrices)
-                new_params = torch.clip(multivariate_normal.sample((1,)).squeeze(0), -1.0, 1.0)
+                new_params = multivariate_normal.sample((1,)).squeeze(0) # TODO: Czy potrzebny clip?
             if scaling:
-                new_params /= self.scale_divisor
+                new_params -= math.log(self.scale_divisor)
                 cloned_params[indices] = new_params
-            params = torch.cat([new_params.clone().detach(), cloned_params], dim=0)
+            cloned_params = torch.cat([new_params.clone().detach(), cloned_params], dim=0)
             stored_state = optimizer.state.get(params, None)  
             if stored_state:
                 stored_state["exp_avg"] = torch.cat([stored_state["exp_avg"], stored_state["exp_avg"][indices]], dim=0)
                 stored_state["exp_avg_sq"] = torch.cat([stored_state["exp_avg_sq"], stored_state["exp_avg_sq"][indices]], dim=0)
                 del optimizer.state[params]
                 params = nn.Parameter(
-                    (params.detach().requires_grad_(True))
+                    (cloned_params.detach().requires_grad_(True))
                 )
                 optimizer.state[params] = stored_state
             else:
                 params = nn.Parameter(
-                    (params.detach().requires_grad_(True))
+                    (cloned_params.detach().requires_grad_(True))
                 )
-            optimizer.param_groups[0]["params"][index] = params
+            optimizer.param_groups[index]["params"][0] = params
             return params
         
         optimizer = self.optimizers().optimizer
@@ -138,7 +136,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _clone_gaussians(self, indices, grad):
         def cloned(params, index, optimizer, indices, grad=None):
             if grad is not None:
-                cloned_params = torch.cat([params.clone().detach(), params[indices].clone().detach() + grad[indices]], dim=0)
+                cloned_params = torch.cat([params.clone().detach(), params[indices].clone().detach() + 1.6e-4 * grad[indices]], dim=0)
             else:
                 cloned_params = torch.cat([params.clone().detach(), params[indices].clone().detach()], dim=0)
             stored_state = optimizer.state.get(params, None)  
@@ -149,12 +147,12 @@ class GaussianSplattingTrainer(pl.LightningModule):
                 params = nn.Parameter(
                     (cloned_params.detach().requires_grad_(True))
                 )
-                optimizer.state[cloned_params] = stored_state
+                optimizer.state[params] = stored_state
             else:
                 params = nn.Parameter(
                     (cloned_params.detach().requires_grad_(True))
                 )
-            optimizer.param_groups[0]["params"][index] = params
+            optimizer.param_groups[index]["params"][0] = params
             return params
         
         optimizer = self.optimizers().optimizer
@@ -172,19 +170,19 @@ class GaussianSplattingTrainer(pl.LightningModule):
         over_recon_indices = torch.argwhere(
             torch.logical_and(
                 torch.linalg.vector_norm(grad, dim=1) > self.pos_grad_threshold,
-                torch.abs(torch.max(self.scaling_vectors, dim=1)[0]) > self.max_scale_threshold
+                torch.abs(torch.max(torch.exp(self.scaling_vectors), dim=1)[0]) > self.max_scale_threshold
             )
         ).flatten()        
         under_recon_indices = torch.argwhere(
             torch.logical_and(
                 torch.linalg.vector_norm(grad, dim=1) > self.pos_grad_threshold,
-                torch.abs(torch.max(self.scaling_vectors, dim=1)[0]) <= self.max_scale_threshold
+                torch.abs(torch.max(torch.exp(self.scaling_vectors), dim=1)[0]) <= self.max_scale_threshold
             )
         ).flatten()
-        if len(over_recon_indices) != 0:
-            self._split_gaussians(over_recon_indices)
         if len(under_recon_indices) != 0:
             self._clone_gaussians(under_recon_indices, grad)
+        if len(over_recon_indices) != 0:
+            self._split_gaussians(over_recon_indices)
 
     def _duplicate_with_keys(self, w, h, means_2d, cov_matrices, z_coords):
         def in_tile(tile_idx, centers, radiuses):
@@ -212,6 +210,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
         image = torch.zeros((h, w, 3), device=self.device)
         for tile_idx, indices in gaussians_for_tiles.items():
+            if indices.shape[0] == 0:
+                continue
             means_2d_sorted = means_2d[indices]
             cov_matrices_sorted = cov_matrices[indices.cpu()].cuda()
             colors = self.colors[indices.cpu()].cuda()
@@ -247,6 +247,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _project_cov_matrices(self, means_camera, extrinsic_matrix, focal_length):
         x_c, y_c, z_c = means_camera
         cov_matrices_3d = self._create_covariance_matrices()
+        print(means_camera[2,:].min())
         jacobian = torch.stack([
             focal_length / z_c,
             torch.zeros_like(x_c),
@@ -261,7 +262,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return cov_matrices_2d, cov_matrices_3d 
 
     def _create_covariance_matrices(self):
-        r, i, j, k = self.quaternions.permute(1, 0)
+        quaternions = torch.nn.functional.normalize(self.quaternions, dim=-1)
+        r, i, j, k = quaternions.permute(1, 0)
         rotation_matrices = 2 * torch.stack([
             1/2 - (j * j + k * k),
             i * j - r * k,
@@ -276,7 +278,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         scaling_matrices = torch.diag_embed(torch.exp(self.scaling_vectors))
         return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
-    def _rasterize(self, h, w, extrinsic_matrix, focal_length):
+    def _rasterize(self, h, w, extrinsic_matrix, focal_length, batch_idx):
         # self._cull_gaussians(extrinsic_matrix, focal_length)
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
         # self._if_uniform_3d_gaussians(self.positions)
@@ -284,8 +286,9 @@ class GaussianSplattingTrainer(pl.LightningModule):
         cov_matrices, cov_matrices_3d = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
         # self.debug_covariances(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d)
         gaussians_for_tiles = self._duplicate_with_keys(w, h, means_2d, cov_matrices, means_camera[2, :])
-        # for i, (_, gaussian) in enumerate(gaussians_for_tiles.items()):
-        #     self.debug_covariances_in_tiles(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d, gaussian, i)
+        # if batch_idx % 10 == 0:
+        #     for i, (_, gaussian) in enumerate(gaussians_for_tiles.items()):
+        #         self.debug_covariances_in_tiles(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d, gaussian, i, batch_idx)
         image = self._blend_in_order(w, h, gaussians_for_tiles, means_2d, cov_matrices)
         return image
 
@@ -298,9 +301,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
         extrinsic_matrix = torch.linalg.inv(pose)
 
+        print(self.opacities)
+
         # if self.global_step % self.densification_interval == 0:
         #     self._densify_gaussians()
-        output = self._rasterize(image.shape[0], image.shape[1], extrinsic_matrix, focal_length)
+        output = self._rasterize(image.shape[0], image.shape[1], extrinsic_matrix, focal_length, batch_idx)
         output = output.permute(2, 0, 1)
         image = image.permute(2, 0, 1)
         loss = (1 - self._lambda) * self.l1_loss(output, image) + self._lambda * (1 - self.ssim(output.unsqueeze(0), image.unsqueeze(0))) / 2
@@ -309,8 +314,9 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss, output, image
 
     def training_step(self, batch, batch_idx):
-        if batch_idx > 5:
-            return
+        # if batch_idx > 5:
+        #     return
+        # print(self.positions)
         loss, _, _ = self.any_step(batch, batch_idx, "train")
         
         return loss
@@ -328,8 +334,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        self._densify_gaussians()
-        # self._prune_gaussians()
+        if self.current_epoch > 0 and self.global_step % self.densification_interval == 0:
+            self._prune_gaussians()
+            self._densify_gaussians()
+        # if self.current_epoch > 0 and self.global_step % self.decreasing_alpha_interval == 0:
+        #     self.opacities.data.fill_(inverse_sigmoid(torch.tensor(1e-6))) # TODO: wybrać
         return super().on_train_batch_end(outputs, batch, batch_idx)
     
     def on_validation_epoch_end(self):
@@ -512,7 +521,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
             print(cov_matrices_3d)
             print(cov_matrices_2d)
             print(self.scaling_vectors[:5])
-    def debug_covariances_in_tiles(self, positions, means_2d, means_camera, extrinsic_matrix, cov_matrices_2d, cov_matrices_3d, indices, i):
+    def debug_covariances_in_tiles(self, positions, means_2d, means_camera, extrinsic_matrix, cov_matrices_2d, cov_matrices_3d, indices, i, batch_idx):
         import matplotlib.pyplot as plt
         import os
         from scene_representation.model.gaussian_splatting.utils import ellipsoid_surface, ellipse_points
@@ -565,7 +574,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
         fig.tight_layout()
         os.makedirs("outputs", exist_ok=True)
-        out_path = os.path.join("outputs", f"project_covariances_tiles_{i}.png")
+        out_path = os.path.join("outputs", f"project_covariances_tiles_{batch_idx}_{i}.png")
         fig.savefig(out_path, dpi=150)
         print(f"saved figure to {out_path}")
         plt.show()
@@ -576,6 +585,6 @@ class GaussianSplattingTrainer(pl.LightningModule):
         # print(f"Camera position in world system: {camera_pos}")
         # print(f"Means positions in 2D: {means_2d}")
 
-        print(cov_matrices_3d)
-        print(cov_matrices_2d)
-        print(self.scaling_vectors[:5])
+        # print(cov_matrices_3d)
+        # print(cov_matrices_2d)
+        # print(self.scaling_vectors[:5])
