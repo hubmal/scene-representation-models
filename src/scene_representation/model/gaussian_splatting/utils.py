@@ -1,3 +1,4 @@
+import math
 import torch
 
 
@@ -28,7 +29,7 @@ def ellipsoid_surface(mean, cov, n_std=2.0, resolution=20):
     ellipsoid = ellipsoid @ eigvecs.transpose(-2, -1)  # rotate into world frame
     ellipsoid = ellipsoid + mean
 
-    return ellipsoid[..., 0].cpu().numpy(), ellipsoid[..., 1].cpu().numpy(), ellipsoid[..., 2].cpu().numpy()
+    return ellipsoid[..., 0].cpu().detach().numpy(), ellipsoid[..., 1].cpu().detach().numpy(), ellipsoid[..., 2].cpu().detach().numpy()
 
 
 def ellipse_points(mean, cov2d, n_std=2.0, num_points=100):
@@ -50,4 +51,4 @@ def ellipse_points(mean, cov2d, n_std=2.0, num_points=100):
     ellipse = ellipse @ eigvecs.transpose(-2, -1)
     ellipse = ellipse + mean
 
-    return ellipse[:, 0].cpu().numpy(), ellipse[:, 1].cpu().numpy()
+    return ellipse[:, 0].cpu().detach().numpy(), ellipse[:, 1].cpu().detach().numpy()

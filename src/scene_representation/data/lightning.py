@@ -63,6 +63,16 @@ class LegoDataModule(pl.LightningDataModule):
             drop_last=True
         )
 
+    def predict_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+
 def get_datamodule(*args, **kwargs):
     return LegoDataModule(*args, **kwargs)
 

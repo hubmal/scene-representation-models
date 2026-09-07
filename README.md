@@ -1,6 +1,14 @@
 # Scene representation models from scratch
 
-Implementations of NeRF and Gaussian Splatting algoritms from scratch using Pytorch.
+Implementations of NeRF and Gaussian Splatting algoritms from scratch using PyTorch.
+
+## NeRF
+
+![NeRF](assets/nerf_result.gif)
+
+## 3DGS
+
+TODO
 
 ## Results
 

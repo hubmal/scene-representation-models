@@ -159,7 +159,8 @@ class NerfTrainer(pl.LightningModule):
                 coarse_output[i:i+chunk_size, ...], fine_output[i:i+chunk_size, ...] = self._render_view(rays_d_batch, ray_points_num, pose)
 
         loss = self.criterion(coarse_output, image_batch) + self.criterion(fine_output, image_batch)
-        self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
+        if mode != "predict":
+            self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
 
         return loss, coarse_output, fine_output, image
 
@@ -189,6 +190,11 @@ class NerfTrainer(pl.LightningModule):
         self.test_ssim.update(self._prepare_for_metrics_calculation(output), self._prepare_for_metrics_calculation(image))
         self.test_lpips.update(self._prepare_for_metrics_calculation(output), self._prepare_for_metrics_calculation(image))
         return loss
+
+    def predict_step(self, batch, batch_idx):
+        _, _, output, image = self.any_step(batch, batch_idx, "predict")
+        output = output.reshape(image.shape[0], image.shape[1], -1)
+        return output
     
     def on_validation_epoch_end(self):
         psnr_coarse_value = self.psnr_coarse.compute()

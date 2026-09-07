@@ -9,16 +9,16 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 def train_with_clearml(task_name, model, dm, max_epochs):
     Task.init(task_name=task_name, project_name=task_name)
-    model = train(model, dm, max_epochs)
+    model = train(model, dm, max_epochs, task_name)
     return model
 
-def train(model, dm, max_epochs):
+def train(model, dm, max_epochs, task_name):
     torch.set_float32_matmul_precision('medium')
 
     logger = TensorBoardLogger("tb_logs", name="my_model")
     checkpoint_callback = ModelCheckpoint(
         dirpath='checkpoints',
-        filename='nerf-epoch-{epoch:02d}',
+        filename=task_name+'-epoch-{epoch:02d}',
         save_top_k=-1,
         every_n_epochs=50,
     )
