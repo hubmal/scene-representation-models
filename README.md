@@ -27,10 +27,12 @@ NERF:
 - [x] View dependence
 - [x] Hierarchical sampling
 - [x] Reproduce results on the LEGO scenes
+
 TODO:
 - [ ] Support for non-synthetic scenes
 
 Gaussian Splatting:
+
 TODO:
 - [ ] Core pipeline implemented and working
 - [ ] Initialization from SfM
