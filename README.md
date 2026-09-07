@@ -1,6 +1,6 @@
 # Scene representation models from scratch
 
-Implementations of NeRF and Gaussian Splatting algoritms from scratch using PyTorch.
+Implementations of NeRF and Gaussian Splatting algorithms from scratch using PyTorch.
 
 ## NeRF
 
@@ -11,8 +11,6 @@ Implementations of NeRF and Gaussian Splatting algoritms from scratch using PyTo
 TODO
 
 ## Results
-
-Due to limited computational resources, training and testing were performed on downsampled images. Specifically, for the LEGO dataset, the resolution used was 200x200.
 
 | Method | Source      | Resolution |  PSNR  |  SSIM  | LPIPS |
 |--------|-------------|:----------:|:------:|:------:|:-----:|
