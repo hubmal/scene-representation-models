@@ -1,7 +1,6 @@
 # CO ZOSTALO:
 # NAPISANIE RASTERIZERA W TRITONIE
 # CULL_GAUSSIANS
-# SPLIT I POWIELANIE GAUSSIANOW
 # LEPSZA INICJALIZACJA (NA INNYM DATASECIE)
 
 import math
@@ -63,8 +62,37 @@ class GaussianSplattingTrainer(pl.LightningModule):
         avg_distances = torch.clip(avg_distances, 1e-7, None)
         return nn.Parameter(torch.log(torch.sqrt(avg_distances[:, None]).repeat(1, 3)))
 
-    def _cull_gaussians(self, camera_params):
-        pass
+    def _cull_gaussians(self, extrinsic_matrix):
+        def cull(params, index, optimizer, indices):
+            stored_grad = params.grad
+            stored_state = optimizer.state.get(params, None)  
+            if stored_state:
+                stored_state["exp_avg"] = stored_state["exp_avg"][indices]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][indices]
+                del optimizer.state[params]
+                params = nn.Parameter(
+                    (params[indices].detach().requires_grad_(True))
+                )
+                optimizer.state[params] = stored_state
+            else:
+                params = nn.Parameter(
+                    (params[indices].detach().requires_grad_(True))
+                )
+            params.grad = stored_grad[indices] if stored_grad is not None else None
+            optimizer.param_groups[index]["params"][0] = params
+            return params
+         
+        means_3d = torch.cat([self.positions, torch.ones((self.positions.shape[0], 1), device=self.device)], axis=-1).permute(1, 0)
+        means_3d_camera = torch.matmul(extrinsic_matrix[:3, :], means_3d)
+        indices = torch.argwhere(means_3d_camera[2] >= 0.01)
+        optimizer = self.optimizers().optimizer
+        
+        self.positions = cull(self.positions, 0, optimizer, indices)
+        self.scaling_vectors = cull(self.scaling_vectors, 1, optimizer, indices)
+        self.quaternions = cull(self.quaternions, 2, optimizer, indices)
+        self.colors = cull(self.colors, 3, optimizer, indices)
+        self.opacities = cull(self.opacities, 4, optimizer, indices)
+        
 
     def _prune_gaussians(self):
         if self.current_epoch < 1:
@@ -247,7 +275,6 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _project_cov_matrices(self, means_camera, extrinsic_matrix, focal_length):
         x_c, y_c, z_c = means_camera
         cov_matrices_3d = self._create_covariance_matrices()
-        print(means_camera[2,:].min())
         jacobian = torch.stack([
             focal_length / z_c,
             torch.zeros_like(x_c),
@@ -258,7 +285,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         ], dim=-1).reshape(-1, 2, 3)
         cov_matrices_2d = jacobian @ extrinsic_matrix[:3, :3] @ cov_matrices_3d @ extrinsic_matrix[:3, :3].transpose(-2, -1) @ jacobian.transpose(-2, -1)
         cov_matrices_2d = (cov_matrices_2d + cov_matrices_2d.transpose(-2, -1)) / 2 # avoid numerical errors - matrix should be symmetric
-        cov_matrices_2d = cov_matrices_2d + 1e-6 * torch.eye(cov_matrices_2d.shape[-1], device=cov_matrices_2d.device) # eigenvalues should not be too small
+        cov_matrices_2d = cov_matrices_2d + 1e-3 * (cov_matrices_2d[:, 0, 0] + cov_matrices_2d[:, 1, 1])[:, None, None] * torch.eye(cov_matrices_2d.shape[-1], device=cov_matrices_2d.device) # eigenvalues should not be too small
         return cov_matrices_2d, cov_matrices_3d 
 
     def _create_covariance_matrices(self):
@@ -279,7 +306,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
     def _rasterize(self, h, w, extrinsic_matrix, focal_length, batch_idx):
-        # self._cull_gaussians(extrinsic_matrix, focal_length)
+        # self._cull_gaussians(extrinsic_matrix)
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
         # self._if_uniform_3d_gaussians(self.positions)
         # self.debug_means(self.positions, means_2d, means_camera, extrinsic_matrix)
@@ -301,7 +328,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
         extrinsic_matrix = torch.linalg.inv(pose)
 
-        print(self.opacities)
+        # print(self.opacities)
 
         # if self.global_step % self.densification_interval == 0:
         #     self._densify_gaussians()
