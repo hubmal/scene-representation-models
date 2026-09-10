@@ -22,15 +22,16 @@ class GaussianSplattingTrainer(pl.LightningModule):
         super(GaussianSplattingTrainer, self).__init__()
 
         # self.num_points = 5000
-        self.num_points = 500
+        # self.num_points = 2000
+        self.num_points = 5000
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
         self.scaling_vectors = self._initialize_scaling_vectors(self.positions.cpu().detach().numpy())
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
         self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.1))
-        self.tiles_size = 25
-        self.tiles_num_h = 4
-        self.tiles_num_w = 4
+        self.tiles_size = 50
+        self.tiles_num_h = 2
+        self.tiles_num_w = 2
         self.pruning_threshold = 0.005
         self.densification_interval = 100
         self.decreasing_alpha_interval = 300
@@ -45,6 +46,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.weight_decay = 5e-5
 
         self.psnr = PSNR(data_range=1.0)
+        self.test_psnr = PSNR(data_range=1.0)
 
     def configure_optimizers(self):
         return torch.optim.AdamW([
@@ -54,6 +56,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
         {"params": [self.colors], "lr": 2.5e-3, "weight_decay": 0},
         {"params": [self.opacities], "lr": 5e-2, "weight_decay": 0},
     ])
+
+    # def _view_frustum_planes(self, extrinsic_matrix):
+    #     R = extrinsic_matrix[:3, :3]
+    #     T = extrinsic_matrix[:3, 3]
+    #     camera_pos = -torch.matmul(torch.linalg.inv(R), T)
+    #     plane1 = 
+    #     return
 
     def _initialize_scaling_vectors(self, positions):
         nbrs = NearestNeighbors(n_neighbors=4, algorithm="ball_tree").fit(positions)
@@ -236,7 +245,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return gaussians_for_tiles
 
     def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
-        image = torch.zeros((h, w, 3), device=self.device)
+        image = torch.ones((h, w, 3), device=self.device)
         for tile_idx, indices in gaussians_for_tiles.items():
             if indices.shape[0] == 0:
                 continue
@@ -258,7 +267,9 @@ class GaussianSplattingTrainer(pl.LightningModule):
             colors = colors.transpose(-2, -1)[None, None, :, :]
             alfas = alfas[:, :, None, :]
             transmittance = torch.cumprod(torch.cat([torch.ones_like(alfas[:, :, :, 0:1], device=self.device), (1 - alfas)[:, :, :, :-1]], dim=-1), dim=-1)
-            image[h1:h2, w1:w2, :] = torch.sum(colors * alfas * transmittance, dim=-1)
+            transmittance_final = transmittance[:, :, :, -1] * (1 - alfas[:, :, :, -1])
+            image[h1:h2, w1:w2, :] *= transmittance_final
+            image[h1:h2, w1:w2, :] += torch.sum(colors * alfas * transmittance, dim=-1)
         image = torch.clamp(image, 0.0, 1.0)
         return image
 
@@ -308,6 +319,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def _rasterize(self, h, w, extrinsic_matrix, focal_length, batch_idx):
         # self._cull_gaussians(extrinsic_matrix)
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
+        # print(means_camera[2].max())
+        # print(means_camera[2].min())
         # self._if_uniform_3d_gaussians(self.positions)
         # self.debug_means(self.positions, means_2d, means_camera, extrinsic_matrix)
         cov_matrices, cov_matrices_3d = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
@@ -327,6 +340,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         focal_length = focal_lengths[0, ...]
 
         extrinsic_matrix = torch.linalg.inv(pose)
+        extrinsic_matrix[1, :] *= -1 
+        extrinsic_matrix[2, :] *= -1
 
         # print(self.opacities)
 
@@ -336,7 +351,9 @@ class GaussianSplattingTrainer(pl.LightningModule):
         output = output.permute(2, 0, 1)
         image = image.permute(2, 0, 1)
         loss = (1 - self._lambda) * self.l1_loss(output, image) + self._lambda * (1 - self.ssim(output.unsqueeze(0), image.unsqueeze(0))) / 2
-        self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
+
+        if mode != "predict":
+            self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
 
         return loss, output, image
 
@@ -349,29 +366,41 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if batch_idx > 5:
-            return
-        loss, output, image = self.any_step(batch, batch_idx, "val")
+        if self.current_epoch % 30 == 0:
+            loss, output, image = self.any_step(batch, batch_idx, "val")
 
-        self.psnr.update(output, image)
-        
-        if batch_idx == 0:
-            self.log_debug_samples(image, output, "val")
+            self.psnr.update(output, image)
+            
+            if batch_idx == 0:
+                self.log_debug_samples(image, output, "val")
 
+            return loss
+
+    def test_step(self, batch, batch_idx):
+        loss, output, image = self.any_step(batch, batch_idx, "test")
+        self.test_psnr.update(output, image)
         return loss
 
+    def predict_step(self, batch, batch_idx):
+        _, output, _ = self.any_step(batch, batch_idx, "predict")
+        return output
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        if self.current_epoch > 0 and self.global_step % self.densification_interval == 0:
-            self._prune_gaussians()
-            self._densify_gaussians()
+        # if self.current_epoch > 0 and self.global_step % self.densification_interval == 0:
+        #     self._prune_gaussians()
+        #     self._densify_gaussians()
         # if self.current_epoch > 0 and self.global_step % self.decreasing_alpha_interval == 0:
-        #     self.opacities.data.fill_(inverse_sigmoid(torch.tensor(1e-6))) # TODO: wybrać
+        #     self.opacities.data.fill_(inverse_sigmoid(torch.tensor(0.01))) # TODO: wybrać
         return super().on_train_batch_end(outputs, batch, batch_idx)
     
     def on_validation_epoch_end(self):
         psnr_value = self.psnr.compute()
         self.log("val_psnr", psnr_value, on_epoch=True, prog_bar=True)
-    
+
+    def on_test_epoch_end(self):
+        test_psnr_value = self.test_psnr.compute()
+        self.log("test_psnr", test_psnr_value, on_epoch=True, prog_bar=True)
+        
     def log_debug_samples(self, img, pred, mode):
         img = img.detach().cpu()
         pred = pred.detach().cpu()
