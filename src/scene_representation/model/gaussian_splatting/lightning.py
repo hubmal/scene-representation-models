@@ -29,15 +29,29 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
         self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.1))
-        self.tiles_size = 50
-        self.tiles_num_h = 2
-        self.tiles_num_w = 2
-        self.pruning_threshold = 0.005
-        self.densification_interval = 100
-        self.decreasing_alpha_interval = 300
-        self.pos_grad_threshold = 2e-4
-        self.max_scale_threshold = 0.01
+        self.tiles_size = 20
+        self.tiles_num_h = 4
+        self.tiles_num_w = 4
+
+        # self.densify_from_iter = 500
+        # self.densify_from_iter = 300
+        self.densify_from_iter = 150
+        # self.densify_until_iter = 15000
+        # self.densify_until_iter = 10000
+        self.densify_until_iter = 5000
+        # self.densification_interval = 100
+        self.densification_interval = 50
+        # self.pos_grad_threshold = 0.0002
+        self.densify_grad_threshold = 0.0004
+        # self.max_scale_threshold = 0.01
+        self.max_scale_threshold = 0.03
+        # self.pruning_threshold = 0.005
+        self.pruning_threshold = 0.01
         self.scale_divisor = 1.6
+        # self.opacity_reset_interval = 3000
+        # self.opacity_reset_interval = 2000
+        self.opacity_reset_interval = 1000
+        self.opacity_reset_value = 0.01
         
         self.l1_loss = nn.L1Loss()
         self.ssim = SSIM()
@@ -70,6 +84,17 @@ class GaussianSplattingTrainer(pl.LightningModule):
         avg_distances = torch.mean(torch.tensor(distances[:, 1:] ** 2, dtype=torch.float32), dim=1)
         avg_distances = torch.clip(avg_distances, 1e-7, None)
         return nn.Parameter(torch.log(torch.sqrt(avg_distances[:, None]).repeat(1, 3)))
+
+    def _if_densification(self):
+        return (
+            self.current_epoch > 0 and
+            self.global_step >= self.densify_from_iter and
+            self.global_step <= self.densify_until_iter and
+            self.global_step % self.densification_interval == 0 
+        )
+
+    def _if_opacity_reset(self):
+        return self._if_densification() and self.global_step % self.opacity_reset_interval == 0
 
     def _cull_gaussians(self, extrinsic_matrix):
         def cull(params, index, optimizer, indices):
@@ -206,13 +231,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
         grad = optimizer.param_groups[0]["params"][0].grad
         over_recon_indices = torch.argwhere(
             torch.logical_and(
-                torch.linalg.vector_norm(grad, dim=1) > self.pos_grad_threshold,
+                torch.linalg.vector_norm(grad, dim=1) > self.densify_grad_threshold,
                 torch.abs(torch.max(torch.exp(self.scaling_vectors), dim=1)[0]) > self.max_scale_threshold
             )
         ).flatten()        
         under_recon_indices = torch.argwhere(
             torch.logical_and(
-                torch.linalg.vector_norm(grad, dim=1) > self.pos_grad_threshold,
+                torch.linalg.vector_norm(grad, dim=1) > self.densify_grad_threshold,
                 torch.abs(torch.max(torch.exp(self.scaling_vectors), dim=1)[0]) <= self.max_scale_threshold
             )
         ).flatten()
@@ -343,7 +368,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         extrinsic_matrix[1, :] *= -1 
         extrinsic_matrix[2, :] *= -1
 
-        # print(self.opacities)
+        print(f"\n{self.positions.shape[0]}")
 
         # if self.global_step % self.densification_interval == 0:
         #     self._densify_gaussians()
@@ -366,7 +391,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if self.current_epoch % 30 == 0:
+        if self.current_epoch % 10 == 0:
             loss, output, image = self.any_step(batch, batch_idx, "val")
 
             self.psnr.update(output, image)
@@ -386,11 +411,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return output
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # if self.current_epoch > 0 and self.global_step % self.densification_interval == 0:
-        #     self._prune_gaussians()
-        #     self._densify_gaussians()
-        # if self.current_epoch > 0 and self.global_step % self.decreasing_alpha_interval == 0:
-        #     self.opacities.data.fill_(inverse_sigmoid(torch.tensor(0.01))) # TODO: wybrać
+        if self._if_densification():
+            self._prune_gaussians()
+            self._densify_gaussians()
+        if self._if_opacity_reset():
+            self.opacities.data.clamp_(max=inverse_sigmoid(self.opacity_reset_value)) # TODO: wybrać
         return super().on_train_batch_end(outputs, batch, batch_idx)
     
     def on_validation_epoch_end(self):
