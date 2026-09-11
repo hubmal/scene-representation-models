@@ -251,23 +251,32 @@ class GaussianSplattingTrainer(pl.LightningModule):
         def in_tile(tile_idx, centers, radiuses):
             h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
             h2, w2 = min(h, h2), min(w, w2)
-            tile = [box(w1, h1, w2, h2)]
-            tree_gaussians = [Point(center).buffer(radius) for center, radius in zip(centers.cpu().detach().numpy(), radiuses.cpu().detach().numpy())]
-            tree = STRtree(tree_gaussians)
-            pairs = tree.query(tile, predicate="intersects")
-            return pairs[1, :]
+            cx, cy = centers[:, 0], centers[:, 1]
+            closest_x = cx.clamp(min=w1, max=w2)
+            closest_y = cy.clamp(min=h1, max=h2)
+            mask = (closest_x - cx) ** 2 + (closest_y - cy) ** 2 <= radiuses ** 2
+            return mask.nonzero(as_tuple=True)[0]
+        start = time.time()
         eigenvalues = torch.linalg.eigvalsh(cov_matrices)
         eigenvalues = eigenvalues.real
         max_eigenvalues, _ = eigenvalues.max(dim=1, keepdim=False)
         radiuses = torch.ceil(2 * torch.sqrt(max_eigenvalues)) # moze do zmiany na 3
         gaussians_for_tiles = {}
+        t1 = time.time()
         for tile_idx in range(self.tiles_num_w * self.tiles_num_h):
-            indices_list = in_tile(tile_idx, means_2d, radiuses)
-            if len(indices_list) == 0:
-                gaussians_for_tiles[tile_idx] = torch.tensor([], device=self.device)
+            # t1 = time.time()
+            indices = in_tile(tile_idx, means_2d, radiuses)
+            # t2 = time.time()
+            if indices.shape[0] == 0:
+                gaussians_for_tiles[tile_idx] = indices
             else:
-                indices = torch.tensor(indices_list, device=self.device)
                 gaussians_for_tiles[tile_idx] = indices[torch.argsort(z_coords[indices])]
+            t3 = time.time()
+            # print(t2 - t1)
+            # print(t3 - t2)
+        t2 = time.time()
+        # print(t1 - start)
+        # print(t2 - t1)
         return gaussians_for_tiles
 
     def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
