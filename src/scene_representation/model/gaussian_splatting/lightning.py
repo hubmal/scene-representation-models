@@ -13,6 +13,7 @@ from sklearn.neighbors import NearestNeighbors
 import torchvision
 from torchmetrics.image import PeakSignalNoiseRatio as PSNR
 from piqa.ssim import SSIM
+import time
 
 from scene_representation.model.gaussian_splatting.utils import inverse_sigmoid
 
@@ -255,7 +256,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
             tree = STRtree(tree_gaussians)
             pairs = tree.query(tile, predicate="intersects")
             return pairs[1, :]
-        eigenvalues, _ = torch.linalg.eig(cov_matrices)
+        eigenvalues = torch.linalg.eigvalsh(cov_matrices)
         eigenvalues = eigenvalues.real
         max_eigenvalues, _ = eigenvalues.max(dim=1, keepdim=False)
         radiuses = torch.ceil(2 * torch.sqrt(max_eigenvalues)) # moze do zmiany na 3
@@ -343,18 +344,27 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
     def _rasterize(self, h, w, extrinsic_matrix, focal_length, batch_idx):
         # self._cull_gaussians(extrinsic_matrix)
+        start = time.time()
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
         # print(means_camera[2].max())
         # print(means_camera[2].min())
         # self._if_uniform_3d_gaussians(self.positions)
         # self.debug_means(self.positions, means_2d, means_camera, extrinsic_matrix)
+        t1 = time.time()
         cov_matrices, cov_matrices_3d = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
+        t2 = time.time()
         # self.debug_covariances(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d)
         gaussians_for_tiles = self._duplicate_with_keys(w, h, means_2d, cov_matrices, means_camera[2, :])
+        t3 = time.time()
         # if batch_idx % 10 == 0:
         #     for i, (_, gaussian) in enumerate(gaussians_for_tiles.items()):
         #         self.debug_covariances_in_tiles(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d, gaussian, i, batch_idx)
         image = self._blend_in_order(w, h, gaussians_for_tiles, means_2d, cov_matrices)
+        t4 = time.time()
+        print(t1 - start)
+        print(t2 - t1)
+        print(t3 - t2)
+        print(t4 - t3)
         return image
 
     def any_step(self, batch, batch_idx, mode):
