@@ -3,7 +3,10 @@ import torch
 
 
 def inverse_sigmoid(x):
-    return torch.log(x / (1 - x))
+    if isinstance(x, torch.Tensor):
+        return torch.log(x / (1 - x))
+    else:
+        return math.log(x / (1 - x))
 
 def ellipsoid_surface(mean, cov, n_std=2.0, resolution=20):
     """

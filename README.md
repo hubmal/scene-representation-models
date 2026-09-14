@@ -32,7 +32,7 @@ TODO:
 Gaussian Splatting:
 
 TODO:
-- [ ] Core pipeline implemented and working
+- [x] Core pipeline implemented and working
 - [ ] Initialization from SfM
 - [ ] Densification methods
 - [ ] Custom Triton renderer

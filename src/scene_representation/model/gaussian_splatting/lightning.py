@@ -22,43 +22,29 @@ class GaussianSplattingTrainer(pl.LightningModule):
     def __init__(self):
         super(GaussianSplattingTrainer, self).__init__()
 
-        # self.num_points = 5000
-        # self.num_points = 2000
-        self.num_points = 5000
+        self.num_points = 100000
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
         self.scaling_vectors = self._initialize_scaling_vectors(self.positions.cpu().detach().numpy())
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
         self.colors = nn.Parameter(torch.rand(self.num_points, 3))
         self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.1))
-        self.tiles_size = 20
-        self.tiles_num_h = 4
-        self.tiles_num_w = 4
+        self.tiles_size = 50
+        self.tiles_num_h = 16
+        self.tiles_num_w = 16
 
-        # self.densify_from_iter = 500
-        # self.densify_from_iter = 300
-        self.densify_from_iter = 150
-        # self.densify_until_iter = 15000
-        # self.densify_until_iter = 10000
-        self.densify_until_iter = 5000
-        # self.densification_interval = 100
-        self.densification_interval = 50
-        # self.pos_grad_threshold = 0.0002
-        self.densify_grad_threshold = 0.0004
-        # self.max_scale_threshold = 0.01
-        self.max_scale_threshold = 0.03
-        # self.pruning_threshold = 0.005
-        self.pruning_threshold = 0.01
+        self.densify_from_iter = 500
+        self.densify_until_iter = 15000
+        self.densification_interval = 100
+        self.densify_grad_threshold = 0.0002
+        self.max_scale_threshold = 0.04
+        self.pruning_threshold = 0.005
         self.scale_divisor = 1.6
-        # self.opacity_reset_interval = 3000
-        # self.opacity_reset_interval = 2000
-        self.opacity_reset_interval = 1000
+        self.opacity_reset_interval = 3000
         self.opacity_reset_value = 0.01
         
         self.l1_loss = nn.L1Loss()
         self.ssim = SSIM()
-        self._lambda = 0.2
-        self.lr = 5e-4
-        self.weight_decay = 5e-5
+        self.ssim_lambda = 0.2
 
         self.psnr = PSNR(data_range=1.0)
         self.test_psnr = PSNR(data_range=1.0)
@@ -71,13 +57,6 @@ class GaussianSplattingTrainer(pl.LightningModule):
         {"params": [self.colors], "lr": 2.5e-3, "weight_decay": 0},
         {"params": [self.opacities], "lr": 5e-2, "weight_decay": 0},
     ])
-
-    # def _view_frustum_planes(self, extrinsic_matrix):
-    #     R = extrinsic_matrix[:3, :3]
-    #     T = extrinsic_matrix[:3, 3]
-    #     camera_pos = -torch.matmul(torch.linalg.inv(R), T)
-    #     plane1 = 
-    #     return
 
     def _initialize_scaling_vectors(self, positions):
         nbrs = NearestNeighbors(n_neighbors=4, algorithm="ball_tree").fit(positions)
@@ -147,7 +126,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
                 params = nn.Parameter(
                     (params[indices].detach().requires_grad_(True))
                 )
-            params.grad = stored_grad[indices]
+            params.grad = stored_grad[indices] if stored_grad is not None else None
             optimizer.param_groups[index]["params"][0] = params
             return params
         
@@ -166,7 +145,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
             cloned_params = params.clone().detach()
             new_params = params[indices].clone().detach()
             if sampling:
-                cov_matrices = self._create_covariance_matrices()[indices]
+                cov_matrices = self._create_covariance_matrices()[indices].float()
                 multivariate_normal = torch.distributions.MultivariateNormal(new_params, cov_matrices)
                 new_params = multivariate_normal.sample((1,)).squeeze(0) # TODO: Czy potrzebny clip?
             if scaling:
@@ -247,37 +226,50 @@ class GaussianSplattingTrainer(pl.LightningModule):
         if len(over_recon_indices) != 0:
             self._split_gaussians(over_recon_indices)
 
+    def _safe_eigvalsh_chunked(self, cov_matrices, chunk_size=50000):
+        results = []
+        for i in range(0, cov_matrices.shape[0], chunk_size):
+            results.append(torch.linalg.eigvalsh(cov_matrices[i:i+chunk_size]))
+        return torch.cat(results, dim=0)
+
     def _duplicate_with_keys(self, w, h, means_2d, cov_matrices, z_coords):
-        def in_tile(tile_idx, centers, radiuses):
-            h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
-            h2, w2 = min(h, h2), min(w, w2)
+        def in_tile(tiles_indices, centers, radiuses):
+            h1 = (tiles_indices // self.tiles_num_h) * self.tiles_size
+            h2 = ((tiles_indices // self.tiles_num_h) + 1) * self.tiles_size
+            w1 = (tiles_indices % self.tiles_num_w) * self.tiles_size
+            w2 = ((tiles_indices % self.tiles_num_w) + 1) * self.tiles_size
+            h2, w2 = h2.clamp(max=h), w2.clamp(max=w)
             cx, cy = centers[:, 0], centers[:, 1]
-            closest_x = cx.clamp(min=w1, max=w2)
-            closest_y = cy.clamp(min=h1, max=h2)
-            mask = (closest_x - cx) ** 2 + (closest_y - cy) ** 2 <= radiuses ** 2
-            return mask.nonzero(as_tuple=True)[0]
-        start = time.time()
-        eigenvalues = torch.linalg.eigvalsh(cov_matrices)
+            closest_x = cx[None, :].clamp(min=w1[:, None], max=w2[:, None])
+            closest_y = cy[None, :].clamp(min=h1[:, None], max=h2[:, None])
+            mask = (closest_x - cx[None, :]) ** 2 + (closest_y - cy[None, :]) ** 2 <= radiuses[None, :] ** 2
+            return mask
+        eigenvalues = self._safe_eigvalsh_chunked(cov_matrices)
         eigenvalues = eigenvalues.real
         max_eigenvalues, _ = eigenvalues.max(dim=1, keepdim=False)
-        radiuses = torch.ceil(2 * torch.sqrt(max_eigenvalues)) # moze do zmiany na 3
+        radiuses = torch.ceil(3 * torch.sqrt(max_eigenvalues))
         gaussians_for_tiles = {}
-        t1 = time.time()
-        for tile_idx in range(self.tiles_num_w * self.tiles_num_h):
-            # t1 = time.time()
-            indices = in_tile(tile_idx, means_2d, radiuses)
-            # t2 = time.time()
+        masks = in_tile(torch.arange(self.tiles_num_w * self.tiles_num_h, device=self.device), means_2d, radiuses)
+        for tile_idx, mask in enumerate(masks):
+            indices = mask.nonzero(as_tuple=True)[0]
             if indices.shape[0] == 0:
                 gaussians_for_tiles[tile_idx] = indices
             else:
                 gaussians_for_tiles[tile_idx] = indices[torch.argsort(z_coords[indices])]
-            t3 = time.time()
-            # print(t2 - t1)
-            # print(t3 - t2)
-        t2 = time.time()
-        # print(t1 - start)
-        # print(t2 - t1)
         return gaussians_for_tiles
+
+    def _gaussian_weight(self, tile_pixels, means_2d_sorted, cov_matrices_sorted):
+        dx = tile_pixels[..., 0] - means_2d_sorted[:, 0]
+        dy = tile_pixels[..., 1] - means_2d_sorted[:, 1]
+
+        a = cov_matrices_sorted[:, 0, 0]
+        b = cov_matrices_sorted[:, 0, 1]
+        c = cov_matrices_sorted[:, 1, 1]
+
+        det = a * c - b * b
+        det = det.clamp(min=1e-8)
+        mdist = (c * dx * dx - 2 * b * dx * dy + a * dy * dy) / det
+        return torch.exp(-0.5 * mdist)
 
     def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
         image = torch.ones((h, w, 3), device=self.device)
@@ -298,8 +290,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
             )
             tile_pixels = torch.stack((x, y), axis=-1)
             tile_pixels = torch.broadcast_to(tile_pixels, (opacities.shape[0], *tile_pixels.shape))
-            alfas = opacities.transpose(-2, -1) * torch.exp(multivariate_normal.log_prob(tile_pixels.permute(1, 2, 0, 3)))
             colors = colors.transpose(-2, -1)[None, None, :, :]
+            gauss_weight = self._gaussian_weight(tile_pixels.permute(1, 2, 0, 3), means_2d_sorted, cov_matrices_sorted)                  # BEZ normalizacji!
+
+            alfas = opacities.transpose(-2, -1) * gauss_weight
+            alfas = torch.clamp(alfas, max=0.99)
             alfas = alfas[:, :, None, :]
             transmittance = torch.cumprod(torch.cat([torch.ones_like(alfas[:, :, :, 0:1], device=self.device), (1 - alfas)[:, :, :, :-1]], dim=-1), dim=-1)
             transmittance_final = transmittance[:, :, :, -1] * (1 - alfas[:, :, :, -1])
@@ -319,7 +314,10 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return means_2d, W_mi
 
     def _project_cov_matrices(self, means_camera, extrinsic_matrix, focal_length):
-        x_c, y_c, z_c = means_camera
+        extrinsic_matrix = extrinsic_matrix.double()
+        focal_length = focal_length.double()
+        x_c, y_c, z_c = means_camera.double()
+        z_c = z_c.clamp(min=0.2)
         cov_matrices_3d = self._create_covariance_matrices()
         jacobian = torch.stack([
             focal_length / z_c,
@@ -331,11 +329,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
         ], dim=-1).reshape(-1, 2, 3)
         cov_matrices_2d = jacobian @ extrinsic_matrix[:3, :3] @ cov_matrices_3d @ extrinsic_matrix[:3, :3].transpose(-2, -1) @ jacobian.transpose(-2, -1)
         cov_matrices_2d = (cov_matrices_2d + cov_matrices_2d.transpose(-2, -1)) / 2 # avoid numerical errors - matrix should be symmetric
-        cov_matrices_2d = cov_matrices_2d + 1e-3 * (cov_matrices_2d[:, 0, 0] + cov_matrices_2d[:, 1, 1])[:, None, None] * torch.eye(cov_matrices_2d.shape[-1], device=cov_matrices_2d.device) # eigenvalues should not be too small
-        return cov_matrices_2d, cov_matrices_3d 
+        cov_matrices_2d[:, 1, 1] += 0.3
+        return cov_matrices_2d.float()
 
     def _create_covariance_matrices(self):
-        quaternions = torch.nn.functional.normalize(self.quaternions, dim=-1)
+        quaternions = torch.nn.functional.normalize(self.quaternions, dim=-1).double()
         r, i, j, k = quaternions.permute(1, 0)
         rotation_matrices = 2 * torch.stack([
             1/2 - (j * j + k * k),
@@ -348,32 +346,15 @@ class GaussianSplattingTrainer(pl.LightningModule):
             j * k + r * i,
             1/2 - (i * i + j * j)
         ], dim=-1).reshape(-1, 3, 3)
-        scaling_matrices = torch.diag_embed(torch.exp(self.scaling_vectors))
+        scales = torch.exp(self.scaling_vectors.clamp(min=-4, max=1.0)).double()
+        scaling_matrices = torch.diag_embed(scales)
         return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
     def _rasterize(self, h, w, extrinsic_matrix, focal_length, batch_idx):
-        # self._cull_gaussians(extrinsic_matrix)
-        start = time.time()
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
-        # print(means_camera[2].max())
-        # print(means_camera[2].min())
-        # self._if_uniform_3d_gaussians(self.positions)
-        # self.debug_means(self.positions, means_2d, means_camera, extrinsic_matrix)
-        t1 = time.time()
-        cov_matrices, cov_matrices_3d = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
-        t2 = time.time()
-        # self.debug_covariances(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d)
+        cov_matrices = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
         gaussians_for_tiles = self._duplicate_with_keys(w, h, means_2d, cov_matrices, means_camera[2, :])
-        t3 = time.time()
-        # if batch_idx % 10 == 0:
-        #     for i, (_, gaussian) in enumerate(gaussians_for_tiles.items()):
-        #         self.debug_covariances_in_tiles(self.positions, means_2d, means_camera, extrinsic_matrix, cov_matrices, cov_matrices_3d, gaussian, i, batch_idx)
         image = self._blend_in_order(w, h, gaussians_for_tiles, means_2d, cov_matrices)
-        t4 = time.time()
-        print(t1 - start)
-        print(t2 - t1)
-        print(t3 - t2)
-        print(t4 - t3)
         return image
 
     def any_step(self, batch, batch_idx, mode):
@@ -387,14 +368,10 @@ class GaussianSplattingTrainer(pl.LightningModule):
         extrinsic_matrix[1, :] *= -1 
         extrinsic_matrix[2, :] *= -1
 
-        print(f"\n{self.positions.shape[0]}")
-
-        # if self.global_step % self.densification_interval == 0:
-        #     self._densify_gaussians()
         output = self._rasterize(image.shape[0], image.shape[1], extrinsic_matrix, focal_length, batch_idx)
         output = output.permute(2, 0, 1)
         image = image.permute(2, 0, 1)
-        loss = (1 - self._lambda) * self.l1_loss(output, image) + self._lambda * (1 - self.ssim(output.unsqueeze(0), image.unsqueeze(0))) / 2
+        loss = (1 - self.ssim_lambda) * self.l1_loss(output, image) + self.ssim_lambda * (1 - self.ssim(output.unsqueeze(0), image.unsqueeze(0))) / 2
 
         if mode != "predict":
             self.log(f"{mode}_loss", loss, on_epoch=True, on_step=True, prog_bar=True)
@@ -402,9 +379,6 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return loss, output, image
 
     def training_step(self, batch, batch_idx):
-        # if batch_idx > 5:
-        #     return
-        # print(self.positions)
         loss, _, _ = self.any_step(batch, batch_idx, "train")
         
         return loss
@@ -415,8 +389,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
 
             self.psnr.update(output, image)
             
-            if batch_idx == 0:
-                self.log_debug_samples(image, output, "val")
+            if batch_idx % 10 == 0:
+                self.log_debug_samples(image, output, "val", batch_idx)
 
             return loss
 
@@ -430,12 +404,16 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return output
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        if self._if_densification():
-            self._prune_gaussians()
-            self._densify_gaussians()
-        if self._if_opacity_reset():
-            self.opacities.data.clamp_(max=inverse_sigmoid(self.opacity_reset_value)) # TODO: wybrać
+        # if self._if_densification():
+        #     self._prune_gaussians()
+        #     self._densify_gaussians()
+        # if self._if_opacity_reset() or self.global_step == self.densify_from_iter:
+        #     self.opacities.data.clamp_(max=inverse_sigmoid(self.opacity_reset_value))
         return super().on_train_batch_end(outputs, batch, batch_idx)
+
+    def on_train_epoch_end(self):
+        print(self.positions.shape[0])
+        return super().on_train_epoch_end()
     
     def on_validation_epoch_end(self):
         psnr_value = self.psnr.compute()
@@ -445,7 +423,7 @@ class GaussianSplattingTrainer(pl.LightningModule):
         test_psnr_value = self.test_psnr.compute()
         self.log("test_psnr", test_psnr_value, on_epoch=True, prog_bar=True)
         
-    def log_debug_samples(self, img, pred, mode):
+    def log_debug_samples(self, img, pred, mode, batch_idx=""):
         img = img.detach().cpu()
         pred = pred.detach().cpu()
 
@@ -453,238 +431,4 @@ class GaussianSplattingTrainer(pl.LightningModule):
         grid = torchvision.utils.make_grid([img, pred])
 
         if self.logger is not None and hasattr(self.logger, "experiment"):
-            self.logger.experiment.add_image(f"{mode}_debug_samples", grid, self.current_epoch)
-
-    def _if_uniform_3d_gaussians(self, positions):
-        import matplotlib.pyplot as plt
-        import os
-
-        w, h = 400, 400
-        focal_length = 300.0
-
-        # --- plot ---------------------------------------------------------------
-        fig = plt.figure(figsize=(11, 5))
-
-        import numpy as np
-        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
-        ax3d.scatter(*zip(*positions.tolist()), s=60)
-        for pos in positions.tolist():
-            ax3d.text(*pos, "")
-        # ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--", label="optical axis")
-        ax3d.set_xlabel("x")
-        ax3d.set_ylabel("y")
-        ax3d.set_zlabel("z")
-        ax3d.set_title("3D scene")
-        ax3d.legend()
-
-        ax2d = fig.add_subplot(1, 2, 2)
-        ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
-        ax2d.set_xlim(-0.2 * w, 1.2 * w)
-        ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
-        ax2d.set_xlabel("u (pixels)")
-        ax2d.set_ylabel("v (pixels)")
-        ax2d.set_title("2D projection (image plane)")
-        ax2d.set_aspect("equal")
-
-        fig.tight_layout()
-        os.makedirs("outputs", exist_ok=True)
-        out_path = os.path.join("outputs", "means_3d.png")
-        fig.savefig(out_path, dpi=150)
-        print(f"saved figure to {out_path}")
-        plt.show()
-
-        print(positions)
-            
-    def debug_means(self, positions, means_2d, means_camera, extrinsic_matrix):
-
-        import matplotlib.pyplot as plt
-        import os
-        colors = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple"]
-
-        w, h = 100, 100
-        focal_length = 300.0
-
-        # --- run the function under test --------------------------------------
-        means_2d = means_2d.cpu().detach().numpy()[:5]
-        depths = means_camera[2].cpu().detach().numpy()[:5]  # camera-space z (depth) per point
-        means_camera = means_camera.permute(1, 0).cpu().detach().numpy()[:5]
-
-        # --- plot ---------------------------------------------------------------
-        fig = plt.figure(figsize=(11, 5))
-
-        R = extrinsic_matrix[:3, :3]
-        T = extrinsic_matrix[:3, 3]
-        camera_pos = -torch.matmul(torch.linalg.inv(R), T)
-        camera_pos = camera_pos.cpu().detach().numpy()
-        import numpy as np
-        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
-        positions = positions
-        ax3d.scatter(*zip(*means_camera.tolist()), c=colors, s=60)
-        for pos in means_camera.tolist():
-            ax3d.text(*pos, "")
-        ax3d.scatter(0, 0, 0, c="black", marker="^", s=100, label="camera")
-        # ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--", label="optical axis")
-        ax3d.set_xlabel("x")
-        ax3d.set_ylabel("y")
-        ax3d.set_zlabel("z")
-        ax3d.set_title("3D scene")
-        ax3d.legend()
-
-        ax2d = fig.add_subplot(1, 2, 2)
-        ax2d.scatter(means_2d[:, 0], means_2d[:, 1], c=colors, s=60)
-        ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
-        ax2d.set_xlim(-0.2 * w, 1.2 * w)
-        ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
-        ax2d.set_xlabel("u (pixels)")
-        ax2d.set_ylabel("v (pixels)")
-        ax2d.set_title("2D projection (image plane)")
-        ax2d.set_aspect("equal")
-
-        fig.tight_layout()
-        os.makedirs("outputs", exist_ok=True)
-        out_path = os.path.join("outputs", "project_means.png")
-        fig.savefig(out_path, dpi=150)
-        print(f"saved figure to {out_path}")
-        plt.show()
-
-        print("camera-space depth (z_c) per gaussian:", depths)
-        # print(F"COLORS: {colors}")
-        print(f"Means positions in camera system: {means_camera}")
-        print(f"Camera position in world system: {camera_pos}")
-        print(f"Means positions in 2D: {means_2d}")
-
-
-    def debug_covariances(self, positions, means_2d, means_camera, extrinsic_matrix, cov_matrices_2d, cov_matrices_3d):
-            import matplotlib.pyplot as plt
-            import os
-            from scene_representation.model.gaussian_splatting.utils import ellipsoid_surface, ellipse_points
-            colors = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple"]
-    
-            w, h = 100, 100
-            focal_length = 300.0
-    
-            # --- run the function under test --------------------------------------
-            means_2d = means_2d[:5]
-            depths = means_camera[2].cpu().detach().numpy()[:5]  # camera-space z (depth) per point
-            means_camera = means_camera.permute(1, 0).cpu().detach().numpy()[:5]
-            cov_matrices_2d = cov_matrices_2d[:5]
-            cov_matrices_3d = cov_matrices_3d[:5]
-
-            R = extrinsic_matrix[:3, :3]
-            T = extrinsic_matrix[:3, 3]
-            camera_pos = -torch.matmul(torch.linalg.inv(R), T)
-            camera_pos = camera_pos.cpu().detach().numpy()
-            target = (0.0, 0.0, 0.0)
-            # --- plot ---------------------------------------------------------------
-            fig = plt.figure(figsize=(11, 5))
-
-            ax3d = fig.add_subplot(1, 2, 1, projection="3d")
-            for mean, cov, c in zip(positions, cov_matrices_3d, colors):
-                X, Y, Z = ellipsoid_surface(mean, cov, n_std=2.0)
-                ax3d.plot_wireframe(X, Y, Z, color=c, alpha=0.5, linewidth=0.5, rstride=2, cstride=2)
-                ax3d.scatter(*mean.tolist(), c=c, s=20)
-            ax3d.scatter(*camera_pos, c="black", marker="^", s=100, label="camera")
-            ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--")
-            ax3d.set_xlabel("x")
-            ax3d.set_ylabel("y")
-            ax3d.set_zlabel("z")
-            ax3d.set_title("3D gaussians (2-std ellipsoids)")
-    
-    
-            ax2d = fig.add_subplot(1, 2, 2)
-            ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
-            for mean2d, cov2d, c in zip(means_2d, cov_matrices_2d, colors):
-                ex, ey = ellipse_points(mean2d, cov2d, n_std=2.0)
-                ax2d.plot(ex, ey, color=c)
-                ax2d.scatter(*mean2d.tolist(), c=c, s=20)
-            ax2d.set_xlim(-0.2 * w, 1.2 * w)
-            ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
-            ax2d.set_xlabel("u (pixels)")
-            ax2d.set_ylabel("v (pixels)")
-            ax2d.set_title("projected 2-std ellipses")
-            ax2d.set_aspect("equal")
-            ax2d.legend(fontsize=8, loc="upper right")
-    
-            fig.tight_layout()
-            os.makedirs("outputs", exist_ok=True)
-            out_path = os.path.join("outputs", "project_covariances.png")
-            fig.savefig(out_path, dpi=150)
-            print(f"saved figure to {out_path}")
-            plt.show()
-    
-            # print("camera-space depth (z_c) per gaussian:", depths)
-            # print(F"COLORS: {colors}")
-            # print(f"Means positions in camera system: {means_camera}")
-            # print(f"Camera position in world system: {camera_pos}")
-            # print(f"Means positions in 2D: {means_2d}")
-
-            print(cov_matrices_3d)
-            print(cov_matrices_2d)
-            print(self.scaling_vectors[:5])
-    def debug_covariances_in_tiles(self, positions, means_2d, means_camera, extrinsic_matrix, cov_matrices_2d, cov_matrices_3d, indices, i, batch_idx):
-        import matplotlib.pyplot as plt
-        import os
-        from scene_representation.model.gaussian_splatting.utils import ellipsoid_surface, ellipse_points
-        # colors = ["tab:red", "tab:blue", "tab:green", "tab:orange", "tab:purple"]
-
-        w, h = 100, 100
-        focal_length = 300.0
-
-        # --- run the function under test --------------------------------------
-        means_2d = means_2d[indices]
-        # depths = means_camera[2].cpu().detach().numpy()[:5]  # camera-space z (depth) per point
-        # means_camera = means_camera.permute(1, 0).cpu().detach().numpy()[:5]
-        cov_matrices_2d = cov_matrices_2d[indices]
-        cov_matrices_3d = cov_matrices_3d[indices]
-
-        R = extrinsic_matrix[:3, :3]
-        T = extrinsic_matrix[:3, 3]
-        camera_pos = -torch.matmul(torch.linalg.inv(R), T)
-        camera_pos = camera_pos.cpu().detach().numpy()
-        target = (0.0, 0.0, 0.0)
-        # --- plot ---------------------------------------------------------------
-        fig = plt.figure(figsize=(11, 5))
-
-        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
-        for mean, cov in zip(positions, cov_matrices_3d):
-            X, Y, Z = ellipsoid_surface(mean, cov, n_std=2.0)
-            ax3d.plot_wireframe(X, Y, Z, alpha=0.5, linewidth=0.5, rstride=2, cstride=2)
-            ax3d.scatter(*mean.tolist(), s=20)
-        ax3d.scatter(*camera_pos, c="black", marker="^", s=100, label="camera")
-        ax3d.plot(*zip(camera_pos, target), c="gray", linestyle="--")
-        ax3d.set_xlabel("x")
-        ax3d.set_ylabel("y")
-        ax3d.set_zlabel("z")
-        ax3d.set_title("3D gaussians (2-std ellipsoids)")
-
-
-        ax2d = fig.add_subplot(1, 2, 2)
-        ax2d.add_patch(plt.Rectangle((0, 0), w, h, fill=False, edgecolor="black"))
-        for mean2d, cov2d in zip(means_2d, cov_matrices_2d):
-            ex, ey = ellipse_points(mean2d, cov2d, n_std=2.0)
-            ax2d.plot(ex, ey)
-            ax2d.scatter(*mean2d.tolist(), s=20)
-        ax2d.set_xlim(-0.2 * w, 1.2 * w)
-        ax2d.set_ylim(1.2 * h, -0.2 * h)  # image convention: y grows downward
-        ax2d.set_xlabel("u (pixels)")
-        ax2d.set_ylabel("v (pixels)")
-        ax2d.set_title("projected 2-std ellipses")
-        ax2d.set_aspect("equal")
-        ax2d.legend(fontsize=8, loc="upper right")
-
-        fig.tight_layout()
-        os.makedirs("outputs", exist_ok=True)
-        out_path = os.path.join("outputs", f"project_covariances_tiles_{batch_idx}_{i}.png")
-        fig.savefig(out_path, dpi=150)
-        print(f"saved figure to {out_path}")
-        plt.show()
-
-        # print("camera-space depth (z_c) per gaussian:", depths)
-        # print(F"COLORS: {colors}")
-        # print(f"Means positions in camera system: {means_camera}")
-        # print(f"Camera position in world system: {camera_pos}")
-        # print(f"Means positions in 2D: {means_2d}")
-
-        # print(cov_matrices_3d)
-        # print(cov_matrices_2d)
-        # print(self.scaling_vectors[:5])
+            self.logger.experiment.add_image(f"{mode}_debug_samples{batch_idx}", grid, self.current_epoch)
