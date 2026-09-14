@@ -16,6 +16,7 @@ from piqa.ssim import SSIM
 import time
 
 from scene_representation.model.gaussian_splatting.utils import inverse_sigmoid
+from scene_representation.model.gaussian_splatting.spherical_harmonics import sh_constants
 
 
 class GaussianSplattingTrainer(pl.LightningModule):
@@ -26,7 +27,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.positions = nn.Parameter(torch.rand(self.num_points, 3) * 2 - 1)
         self.scaling_vectors = self._initialize_scaling_vectors(self.positions.cpu().detach().numpy())
         self.quaternions = nn.Parameter(torch.cat([torch.ones(self.num_points, 1), torch.zeros(self.num_points, 3)], dim=-1))
-        self.colors = nn.Parameter(torch.rand(self.num_points, 3))
+        # self.colors = nn.Parameter(torch.rand(self.num_points, 3))
+        self.sh_weights = nn.Parameter(torch.rand(self.num_points, 3, 16))
         self.opacities = nn.Parameter(inverse_sigmoid(torch.ones(self.num_points, 1) * 0.1))
         self.tiles_size = 50
         self.tiles_num_h = 16
@@ -54,7 +56,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         {"params": [self.positions], "lr": 1.6e-4, "weight_decay": 1.6e-6},
         {"params": [self.scaling_vectors], "lr": 5e-3, "weight_decay": 0},
         {"params": [self.quaternions], "lr": 1e-3, "weight_decay": 0},
-        {"params": [self.colors], "lr": 2.5e-3, "weight_decay": 0},
+        # {"params": [self.colors], "lr": 2.5e-3, "weight_decay": 0},
+        {"params": [self.sh_weights], "lr": 2.5e-3, "weight_decay": 0},
         {"params": [self.opacities], "lr": 5e-2, "weight_decay": 0},
     ])
 
@@ -104,7 +107,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.positions = cull(self.positions, 0, optimizer, indices)
         self.scaling_vectors = cull(self.scaling_vectors, 1, optimizer, indices)
         self.quaternions = cull(self.quaternions, 2, optimizer, indices)
-        self.colors = cull(self.colors, 3, optimizer, indices)
+        # self.colors = cull(self.colors, 3, optimizer, indices)
+        self.sh_weights = cull(self.sh_weights, 3, optimizer, indices)
         self.opacities = cull(self.opacities, 4, optimizer, indices)
         
 
@@ -136,7 +140,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.positions = prune(self.positions, 0, optimizer, indices)
         self.scaling_vectors = prune(self.scaling_vectors, 1, optimizer, indices)
         self.quaternions = prune(self.quaternions, 2, optimizer, indices)
-        self.colors = prune(self.colors, 3, optimizer, indices)
+        # self.colors = prune(self.colors, 3, optimizer, indices)
+        self.sh_weights = prune(self.sh_weights, 3, optimizer, indices)
         self.opacities = prune(self.opacities, 4, optimizer, indices)
 
 
@@ -172,7 +177,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.positions = split(self.positions, 0, optimizer, indices, sampling=True)
         self.scaling_vectors = split(self.scaling_vectors, 1, optimizer, indices, scaling=True)
         self.quaternions = split(self.quaternions, 2, optimizer, indices)
-        self.colors = split(self.colors, 3, optimizer, indices)
+        self.sh_weights = split(self.sh_weights, 3, optimizer, indices)
+        # self.colors = split(self.colors, 3, optimizer, indices)
         self.opacities = split(self.opacities, 4, optimizer, indices)
 
     def _clone_gaussians(self, indices, grad):
@@ -201,7 +207,8 @@ class GaussianSplattingTrainer(pl.LightningModule):
         self.positions = cloned(self.positions, 0, optimizer, indices, grad)
         self.scaling_vectors = cloned(self.scaling_vectors, 1, optimizer, indices)
         self.quaternions = cloned(self.quaternions, 2, optimizer, indices)
-        self.colors = cloned(self.colors, 3, optimizer, indices)
+        # self.colors = cloned(self.colors, 3, optimizer, indices)
+        self.sh_weights = cloned(self.sh_weights, 3, optimizer, indices)
         self.opacities = cloned(self.opacities, 4, optimizer, indices)
 
     def _densify_gaussians(self):
@@ -271,16 +278,33 @@ class GaussianSplattingTrainer(pl.LightningModule):
         mdist = (c * dx * dx - 2 * b * dx * dy + a * dy * dy) / det
         return torch.exp(-0.5 * mdist)
 
-    def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices):
+    def _calculate_colors(self, sh_weights, positions, camera_pos):
+        direction_vectors = torch.nn.functional.normalize(positions - camera_pos[None, :], dim=-1).permute(1, 0)
+        x, y, z = direction_vectors
+        coeffs = torch.stack([
+            sh_constants[0] * torch.ones_like(x), -sh_constants[1] * y, sh_constants[2] * z, -sh_constants[3] * x,
+            sh_constants[4] * x * y, sh_constants[5] * y * z, sh_constants[6] * (2 * z * z - x * x - y * y),
+            sh_constants[7] * x * z, sh_constants[8] * (x * x - y * y), sh_constants[9] * y * (3 * x * x - y * y),
+            sh_constants[10] * x * y * z, sh_constants[11] * y * (4 * z * z - x * x - y * y),
+            sh_constants[12] * z * (2 * z * z - 3 * x * x - 3 * y * y),
+            sh_constants[13] * x * (4 * z * z - x * x - y * y),
+            sh_constants[14] * z * (x * x - y * y), sh_constants[15] * x * (x * x - 3 * y * y)
+        ], dim=-1)
+        return torch.sigmoid(torch.sum(coeffs[:, None, :] * sh_weights, dim=-1))
+    
+    def _blend_in_order(self, w, h, gaussians_for_tiles, means_2d, cov_matrices, camera_pos):
         image = torch.ones((h, w, 3), device=self.device)
         for tile_idx, indices in gaussians_for_tiles.items():
             if indices.shape[0] == 0:
                 continue
+            positions = self.positions[indices.cpu()].cuda()
             means_2d_sorted = means_2d[indices]
             cov_matrices_sorted = cov_matrices[indices.cpu()].cuda()
-            colors = self.colors[indices.cpu()].cuda()
+            # colors = self.colors[indices.cpu()].cuda()
+            sh_weights = self.sh_weights[indices.cpu()].cuda()
+            colors = self._calculate_colors(sh_weights, positions, camera_pos)
             opacities = torch.sigmoid(self.opacities[indices.cpu()].cuda())
-            multivariate_normal = torch.distributions.MultivariateNormal(means_2d_sorted, cov_matrices_sorted)
+            # multivariate_normal = torch.distributions.MultivariateNormal(means_2d_sorted, cov_matrices_sorted)
             h1, h2, w1, w2 = (tile_idx // self.tiles_num_h) * self.tiles_size, ((tile_idx // self.tiles_num_h) + 1) * self.tiles_size, (tile_idx % self.tiles_num_w) * self.tiles_size, ((tile_idx % self.tiles_num_w) + 1) * self.tiles_size
             h2, w2 = min(h, h2), min(w, w2)
             y, x = torch.meshgrid(
@@ -351,10 +375,13 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return rotation_matrices @ scaling_matrices @ scaling_matrices.transpose(-2, -1) @ rotation_matrices.transpose(-2, -1)
 
     def _rasterize(self, h, w, extrinsic_matrix, focal_length, batch_idx):
+        R = extrinsic_matrix[:3, :3]
+        t = extrinsic_matrix[:3, 3]
+        camera_pos = -R.T @ t
         means_2d, means_camera = self._project_means(w, h, extrinsic_matrix, focal_length)
         cov_matrices = self._project_cov_matrices(means_camera, extrinsic_matrix, focal_length)
         gaussians_for_tiles = self._duplicate_with_keys(w, h, means_2d, cov_matrices, means_camera[2, :])
-        image = self._blend_in_order(w, h, gaussians_for_tiles, means_2d, cov_matrices)
+        image = self._blend_in_order(w, h, gaussians_for_tiles, means_2d, cov_matrices, camera_pos)
         return image
 
     def any_step(self, batch, batch_idx, mode):
@@ -404,11 +431,11 @@ class GaussianSplattingTrainer(pl.LightningModule):
         return output
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        # if self._if_densification():
-        #     self._prune_gaussians()
-        #     self._densify_gaussians()
-        # if self._if_opacity_reset() or self.global_step == self.densify_from_iter:
-        #     self.opacities.data.clamp_(max=inverse_sigmoid(self.opacity_reset_value))
+        if self._if_densification():
+            self._prune_gaussians()
+            self._densify_gaussians()
+        if self._if_opacity_reset() or self.global_step == self.densify_from_iter:
+            self.opacities.data.clamp_(max=inverse_sigmoid(self.opacity_reset_value))
         return super().on_train_batch_end(outputs, batch, batch_idx)
 
     def on_train_epoch_end(self):
